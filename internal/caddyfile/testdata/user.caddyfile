@@ -1,0 +1,70 @@
+# Global options block - sets up your Porkbun keys for Let's Encrypt
+{
+	admin 0.0.0.0:2019 # exposed admin API
+
+    acme_dns porkbun {
+        api_key "redacted"
+        api_secret_key "redacted"
+    }
+}
+
+# DNS filter
+dns.example.com {
+    # Redirects the root to /admin automatically
+    redir / /admin/ 301
+    reverse_proxy localhost:8080
+}
+
+# Hypervisor
+vm.example.com {
+    reverse_proxy https://192.168.1.20:8443 {
+        # The hypervisor uses a self-signed certificate
+        # This tells Caddy to trust the backend connection
+        transport http {
+            tls_insecure_skip_verify
+        }
+    }
+}
+
+# Storage
+storage.example.com {
+    reverse_proxy https://192.168.1.21:10000 {
+        # 1. Fixes incoming headers for the web panel
+        header_up Host {upstream_hostport}
+        header_up X-Forwarded-Host {host}
+        
+        # 2. Catches the panel's internal IP redirects and forces them back to your domain
+        header_down Location https://192.168.1.21:10000 https://storage.example.com
+        
+        transport http {
+            tls_insecure_skip_verify
+        }
+    }
+}
+
+# Music
+music.example.com {
+    reverse_proxy http://192.168.1.30:4000
+}
+
+# Home automation
+home.example.com {
+    reverse_proxy http://192.168.1.40:8200
+}
+
+# Sharing
+share.example.com {
+    reverse_proxy http://192.168.1.30:5050
+}
+
+# Dashboard
+dash.example.com {
+    reverse_proxy http://192.168.1.50:8080
+}
+
+
+#webapp testing
+app.example.com {
+    reverse_proxy http://192.168.1.60:9080
+}
+

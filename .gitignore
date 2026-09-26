@@ -1,0 +1,5 @@
+/caddyweb
+/dist/
+/data/
+*.test
+.DS_Store
