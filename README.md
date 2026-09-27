@@ -106,3 +106,11 @@ make dist    # release binaries for amd64 / arm64 / armv7 / armv6
 **AI agents and contributors: read [AGENTS.md](AGENTS.md) first** — it
 explains the architecture, the invariants that keep your Caddyfile safe, and
 how to add directives, DNS providers and API endpoints.
+
+## Contributing
+
+Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+[MIT](LICENSE) — free to use, change and share; keep the copyright notice.
