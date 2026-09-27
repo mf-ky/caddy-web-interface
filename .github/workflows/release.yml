@@ -30,6 +30,10 @@ jobs:
           tar xzf caddy.tgz caddy && sudo mv caddy /usr/local/bin/
       - run: go test ./...
       - run: make dist VERSION=${VERSION}
+      - name: Replace an existing release with the same version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete "$VERSION" --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" || true
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.VERSION }}
