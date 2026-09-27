@@ -1,8 +1,15 @@
-# Push a tag like v1.0.0 to publish binaries (used by scripts/install.sh).
+# Publishes the binaries that scripts/install.sh downloads.
+# Either push a tag like v1.0.0, or run this workflow by hand (Actions tab →
+# Release → Run workflow) and type the version; the tag is created for you.
 name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. v0.1.0"
+        required: true
 
 permissions:
   contents: write
@@ -10,15 +17,24 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Install Caddy (for the end-to-end test)
+        run: |
+          curl -fsSL -o caddy.tgz https://github.com/caddyserver/caddy/releases/download/v2.10.2/caddy_2.10.2_linux_amd64.tar.gz
+          tar xzf caddy.tgz caddy && sudo mv caddy /usr/local/bin/
       - run: go test ./...
-      - run: make dist VERSION=${GITHUB_REF_NAME}
+      - run: make dist VERSION=${VERSION}
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.VERSION }}
+          target_commitish: ${{ github.sha }}
+          name: CaddyWeb ${{ env.VERSION }}
           files: |
             dist/caddyweb-linux-*
             dist/SHA256SUMS
