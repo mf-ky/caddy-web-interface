@@ -32,6 +32,9 @@ function append(el, children) {
 
 export function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); return el; }
 
+/** Replace an element's children, skipping null/false and flattening arrays. */
+export function fill(el, ...children) { clear(el); append(el, children); return el; }
+
 // ---- icons (paths adapted from the ISC-licensed Lucide set) ----
 const ICONS = {
   proxy: '<path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/>',
@@ -180,12 +183,12 @@ export function modal({ title, body, actions = [], wide = false, dismissible = t
     });
     footer.appendChild(btn);
   }
-  box.append(
+  append(box, [
     h('div', { class: 'modal-head' }, h('h2', null, title),
       dismissible ? h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Close', onclick: close }, icon('x')) : null),
     h('div', { class: 'modal-body' }, body),
     actions.length ? footer : null,
-  );
+  ]);
   backdrop.appendChild(box);
   if (dismissible) backdrop.addEventListener('mousedown', (e) => { if (e.target === backdrop) close(); });
   document.body.appendChild(backdrop);
@@ -226,7 +229,7 @@ export function drawer({ title, header, body, footer, onClose }) {
     if (onClose) onClose();
   };
   layer.close = () => close();
-  panel.append(header, h('div', { class: 'drawer-body' }, body), footer);
+  append(panel, [header, h('div', { class: 'drawer-body' }, body), footer]);
   backdrop.appendChild(panel);
   backdrop.addEventListener('mousedown', (e) => { if (e.target === backdrop) layer.close(); });
   document.body.appendChild(backdrop);

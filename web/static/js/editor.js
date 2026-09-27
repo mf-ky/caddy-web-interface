@@ -2,7 +2,7 @@
 // tab. Works on a deep copy of the card; nothing is saved until "Save to
 // draft", and nothing goes live until "Apply".
 
-import { h, icon, api, toast, modal, drawer, field, toggle, select, confirmDialog, codeBlock } from './lib.js';
+import { h, icon, api, toast, modal, drawer, field, toggle, select, confirmDialog, codeBlock, fill } from './lib.js';
 import {
   quote, unquote, dir, blockDir, name, args, directives, find, findAll, clone, toPayload, classify, TYPES, segTitle,
   DNS_PROVIDERS, providerById, readProvider, buildProvider, ACME_CAS, addresses,
@@ -15,7 +15,7 @@ function blockEditor(nodes, ctx) {
   const wrap = h('div', { class: 'block-editor' });
   const render = () => {
     const visible = nodes.filter((n) => !ctx.hideNode || !ctx.hideNode(n, nodes));
-    wrap.replaceChildren(
+    fill(wrap, 
       visible.length ? null : h('div', { class: 'empty-block' }, 'Nothing here yet — add a behavior below.'),
       ...visible.map((n) => itemCard(n, nodes, ctx, render)),
       addButton(nodes, ctx, render));
@@ -29,7 +29,7 @@ function itemCard(node, nodes, ctx, rerender) {
   let rawMode = node.__raw !== undefined || (node.type === 'directive' && !d.editor);
   const body = h('div', { class: 'item-body' });
   const renderBody = () => {
-    body.replaceChildren();
+    fill(body, );
     if (node.type === 'comment') {
       body.append(h('input', { type: 'text', class: 'mono comment-input', value: node.text, oninput: (e) => { node.text = e.target.value; } }));
     } else if (rawMode) {
@@ -147,7 +147,7 @@ function certSection(work, ctx, onAddrChange) {
       parts.push(providerForm(dnsNode, 'dns', ctx, (n) => { t.block[t.block.indexOf(find(t.block, 'dns'))] = n; }));
     }
     if (mode === 'advanced') parts.push(rawEditor(t, ctx));
-    wrap.replaceChildren(...parts);
+    fill(wrap, ...parts);
   };
   render();
   return wrap;
@@ -164,7 +164,7 @@ function providerForm(node, keyword, ctx, onReplace) {
     if (cur.id && !p) known.unshift([cur.id, cur.id + ' (other)']);
     const update = () => onReplace(node = buildProvider(keyword, cur.id, cur.values, cur.extraArgs));
     const missing = cur.id && ctx.dnsChecked && !installed.includes(cur.id);
-    wrap.replaceChildren(
+    fill(wrap, 
       field('DNS provider', select([['', 'Choose your DNS provider…'], ...known], cur.id, (v) => { cur = { id: v, values: {}, extraArgs: [] }; update(); render(); })),
       missing ? h('div', { class: 'callout callout-warn' }, icon('alert'), h('div', null,
         h('strong', null, `The ${p ? p.name : cur.id} module isn’t installed in your Caddy.`),
@@ -250,7 +250,7 @@ function globalForm(work, ctx) {
   const providerHost = h('div');
   const renderProvider = () => {
     const node = find(nodes, 'acme_dns');
-    providerHost.replaceChildren(
+    fill(providerHost, 
       toggle('Use a DNS provider to get certificates', !!node, (on) => {
         if (on) nodes.push(buildProvider('acme_dns', 'cloudflare', {}));
         else { const i = nodes.findIndex((n) => name(n) === 'acme_dns'); if (i >= 0) nodes.splice(i, 1); }
@@ -265,7 +265,7 @@ function globalForm(work, ctx) {
   if (!adminOpts.some(([v]) => v === adminVal)) adminOpts.push([adminVal, adminVal]);
   const knownOpts = new Set(['email', 'acme_ca', 'admin', 'acme_dns']);
   const otherNodes = h('div');
-  const renderOthers = () => otherNodes.replaceChildren(blockEditor(nodes, { ...ctx, hideNode: (n) => knownOpts.has(name(n)) }));
+  const renderOthers = () => fill(otherNodes, blockEditor(nodes, { ...ctx, hideNode: (n) => knownOpts.has(name(n)) }));
   renderOthers();
 
   return h('div', { class: 'form' },
@@ -287,7 +287,8 @@ function globalForm(work, ctx) {
 
 /**
  * openEditor({seg, isNew, readOnly, ctx})
- * ctx: {indent, domains, snippets, dnsInstalled, dnsChecked, globalProvider, rev(), onState(state), isAdmin, firstAddress}
+ * ctx: {base ('/api/servers/<id>'), indent, domains, snippets, dnsInstalled, dnsChecked, globalProvider,
+ *       rev(), onState(state), isAdmin, role, servers:[{id,name}], serverId}
  */
 export function openEditor({ seg, isNew = false, readOnly = false, ctx }) {
   const work = clone(seg);
@@ -305,10 +306,10 @@ export function openEditor({ seg, isNew = false, readOnly = false, ctx }) {
   const status = seg.status && seg.status !== 'unchanged' ? h('span', { class: 'badge badge-' + seg.status }, { new: 'New — not applied', modified: 'Changed — not applied', deleted: 'Will be removed' }[seg.status]) : null;
 
   const renderBody = async () => {
-    tabs.replaceChildren(
+    fill(tabs, 
       h('button', { class: 'tab' + (mode === 'form' ? ' active' : ''), type: 'button', role: 'tab', onclick: () => switchTo('form') }, icon('edit'), readOnly ? 'Overview' : 'Settings'),
       h('button', { class: 'tab' + (mode === 'text' ? ' active' : ''), type: 'button', role: 'tab', onclick: () => switchTo('text') }, icon('code'), 'Caddyfile text'));
-    body.replaceChildren();
+    fill(body, );
     if (mode === 'text') {
       if (readOnly) { body.append(codeBlock(seg.text || '', { copy: true, cls: 'code-lg' })); return; }
       const ta = h('textarea', { class: 'mono raw code-editor', spellcheck: 'false', rows: 22, oninput: (e) => { rawText = e.target.value; } }, rawText ?? '');
@@ -328,10 +329,10 @@ export function openEditor({ seg, isNew = false, readOnly = false, ctx }) {
     if (readOnly) { mode = m; renderBody(); return; }
     try {
       if (m === 'text') {
-        const r = await api('POST', '/api/draft/preview', { segment: toPayload(work) });
+        const r = await api('POST', ctx.base + '/draft/preview', { segment: toPayload(work) });
         rawText = r.text;
       } else {
-        const r = await api('POST', '/api/draft/preview', { text: rawText });
+        const r = await api('POST', ctx.base + '/draft/preview', { text: rawText });
         const s = r.segment;
         Object.assign(work, { kind: s.kind, comments: s.comments || [], header: s.header || [], headerComment: s.headerComment || '', nodes: s.nodes || [] });
         rawText = null;
@@ -350,11 +351,11 @@ export function openEditor({ seg, isNew = false, readOnly = false, ctx }) {
       let res;
       const payload = mode === 'text' ? { text: rawText } : { segment: toPayload(work) };
       if (isNew) {
-        res = await api('POST', `/api/draft/segments?rev=${rev}`, payload);
+        res = await api('POST', `${ctx.base}/draft/segments?rev=${rev}`, payload);
       } else if (mode === 'text') {
-        res = await api('PUT', `/api/draft/segments/${seg.id}/raw?rev=${rev}&key=${encodeURIComponent(seg.key)}`, payload);
+        res = await api('PUT', `${ctx.base}/draft/segments/${seg.id}/raw?rev=${rev}&key=${encodeURIComponent(seg.key)}`, payload);
       } else {
-        res = await api('PUT', `/api/draft/segments/${seg.id}?rev=${rev}&key=${encodeURIComponent(seg.key)}`, payload);
+        res = await api('PUT', `${ctx.base}/draft/segments/${seg.id}?rev=${rev}&key=${encodeURIComponent(seg.key)}`, payload);
       }
       ctx.onState(res);
       toast(isNew ? 'Card added to your draft. Press Apply to make it live.' : 'Saved to your draft. Press Apply to make it live.', 'ok');
@@ -369,7 +370,7 @@ export function openEditor({ seg, isNew = false, readOnly = false, ctx }) {
     const ok = await confirmDialog('Remove this card?', `“${segTitle(seg)}” will be removed from the draft. It stays live until you press Apply, and you can restore it before then.`, { confirm: 'Remove', danger: true });
     if (!ok) return;
     try {
-      const res = await api('DELETE', `/api/draft/segments/${seg.id}?rev=${ctx.rev()}&key=${encodeURIComponent(seg.key)}`);
+      const res = await api('DELETE', `${ctx.base}/draft/segments/${seg.id}?rev=${ctx.rev()}&key=${encodeURIComponent(seg.key)}`);
       ctx.onState(res);
       toast('Removed from the draft. Press Apply to make it live.', 'ok');
       d.close();
@@ -378,7 +379,7 @@ export function openEditor({ seg, isNew = false, readOnly = false, ctx }) {
 
   const revert = async () => {
     try {
-      const res = await api('POST', `/api/draft/segments/${seg.id}/revert?rev=${ctx.rev()}&key=${encodeURIComponent(seg.key)}`);
+      const res = await api('POST', `${ctx.base}/draft/segments/${seg.id}/revert?rev=${ctx.rev()}&key=${encodeURIComponent(seg.key)}`);
       ctx.onState(res);
       toast(seg.status === 'new' ? 'Discarded the new card.' : 'Card is back to what is live on the server.', 'ok');
       d.close();
@@ -387,7 +388,7 @@ export function openEditor({ seg, isNew = false, readOnly = false, ctx }) {
 
   const preview = async () => {
     try {
-      const r = mode === 'text' ? await api('POST', '/api/draft/preview', { text: rawText }) : await api('POST', '/api/draft/preview', { segment: toPayload(work) });
+      const r = mode === 'text' ? await api('POST', ctx.base + '/draft/preview', { text: rawText }) : await api('POST', ctx.base + '/draft/preview', { segment: toPayload(work) });
       modal({ title: 'Caddyfile preview', wide: true, body: h('div', null, h('p', { class: 'muted' }, 'This block will be written to the Caddyfile like this:'), codeBlock(r.text, { cls: 'code-lg' })) });
     } catch (e) { toast(e.message, 'error', 8000); }
   };
@@ -401,11 +402,30 @@ export function openEditor({ seg, isNew = false, readOnly = false, ctx }) {
 
   const saveBtn = h('button', { class: 'btn btn-primary', type: 'button' }, icon('check'), isNew ? 'Add to draft' : 'Save to draft');
   saveBtn.addEventListener('click', () => save(saveBtn));
+  const copyTo = async () => {
+    const others = (ctx.servers || []).filter((x) => x.id !== ctx.serverId);
+    let target = others[0] ? others[0].id : '';
+    modal({
+      title: 'Copy to another server',
+      body: h('div', { class: 'stack' },
+        h('p', null, `A copy of “${segTitle(seg)}” is added to the other server’s draft. Nothing goes live there until someone applies it.`),
+        field('Server', select(others.map((x) => [x.id, x.name]), target, (v) => { target = v; }))),
+      actions: [{ label: 'Cancel' }, { label: 'Copy', kind: 'primary', icon: 'copy', onClick: async () => {
+        try {
+          const r = await api('POST', `${ctx.base}/draft/segments/${seg.id}/copy?key=${encodeURIComponent(seg.key)}`, { target });
+          toast(`Copied to ${r.target}. Open that server to review and apply it.`, 'ok', 6000);
+        } catch (e) { toast(e.message, 'error', 8000); return false; }
+      } }],
+    });
+  };
+  const canCopy = !isNew && seg.kind !== 'global' && ctx.role !== 'viewer' && (ctx.servers || []).length > 1 && seg.status !== 'deleted' &&
+    (ctx.isAdmin || seg.kind === 'site');
   const footer = h('div', { class: 'drawer-foot' },
-    !readOnly && !isNew && seg.canDelete && seg.status !== 'deleted' ? h('button', { class: 'btn btn-danger-ghost', type: 'button', onclick: del }, icon('trash'), 'Remove') : null,
-    !readOnly && !isNew && ctx.isAdmin && (seg.status === 'modified' || seg.status === 'new') ? h('button', { class: 'btn btn-ghost', type: 'button', onclick: revert }, icon('undo'), seg.status === 'new' ? 'Discard' : 'Undo changes') : null,
+    !readOnly && !isNew && seg.canDelete && seg.status !== 'deleted' ? h('button', { class: 'btn btn-sm btn-danger-ghost', type: 'button', onclick: del }, icon('trash'), 'Remove') : null,
+    !readOnly && !isNew && ctx.isAdmin && (seg.status === 'modified' || seg.status === 'new') ? h('button', { class: 'btn btn-sm btn-ghost', type: 'button', onclick: revert }, icon('undo'), seg.status === 'new' ? 'Discard' : 'Undo') : null,
     h('span', { class: 'spacer' }),
-    !readOnly ? h('button', { class: 'btn btn-ghost', type: 'button', onclick: preview }, icon('eye'), 'Preview') : null,
+    canCopy ? h('button', { class: 'btn btn-sm btn-ghost', type: 'button', title: 'Copy this card to another server', onclick: copyTo }, icon('copy'), 'Copy to…') : null,
+    !readOnly ? h('button', { class: 'btn btn-sm btn-ghost', type: 'button', onclick: preview }, icon('eye'), 'Preview') : null,
     h('button', { class: 'btn', type: 'button', onclick: () => d.close() }, readOnly ? 'Close' : 'Cancel'),
     !readOnly ? saveBtn : null);
 

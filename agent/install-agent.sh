@@ -26,13 +26,24 @@ fail() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || fail "Please run with sudo:  sudo bash $0"
 
+# If the user already exists (e.g. CaddyWeb itself runs on this machine as
+# "caddyweb"), reuse it and its home directory.
+if id "$AGENT_USER" >/dev/null 2>&1; then
+	AGENT_HOME="$(getent passwd "$AGENT_USER" | cut -d: -f6)"
+fi
+
 if [ "${1:-}" = "--uninstall" ]; then
 	say "Removing the CaddyWeb agent"
 	if [ -f "$AGENT_HOME/original-perms" ]; then
 		read -r owner mode < "$AGENT_HOME/original-perms" || true
 		[ -n "${owner:-}" ] && chown "$owner" "$CADDYFILE" && chmod "$mode" "$CADDYFILE" && say "Restored $CADDYFILE ownership to $owner ($mode)"
 	fi
-	id "$AGENT_USER" >/dev/null 2>&1 && userdel -r "$AGENT_USER" 2>/dev/null || true
+	if [ -f "$AGENT_HOME/.created-by-caddyweb-agent" ]; then
+		userdel -r "$AGENT_USER" 2>/dev/null || true
+	else
+		# the user belongs to a CaddyWeb installation on this machine: only revoke the key
+		rm -f "$AGENT_HOME/.ssh/authorized_keys" "$AGENT_HOME/original-perms"
+	fi
 	rm -f "$AGENT_BIN" /etc/caddyweb-agent.conf
 	say "Done. Caddy, your Caddyfile and the backups in $BACKUP_DIR were left untouched."
 	exit 0
@@ -46,9 +57,15 @@ esac
 command -v caddy >/dev/null 2>&1 || fail "caddy was not found on this machine. Install the agent on the server that runs Caddy."
 [ -f "$CADDYFILE" ] || fail "No Caddyfile at $CADDYFILE. Re-run with CADDYFILE=/path/to/Caddyfile sudo -E bash $0"
 
-say "Creating system user '$AGENT_USER'"
+say "Setting up system user '$AGENT_USER'"
 if ! id "$AGENT_USER" >/dev/null 2>&1; then
 	useradd --system --home-dir "$AGENT_HOME" --create-home --shell /bin/sh --comment "CaddyWeb agent" "$AGENT_USER"
+	touch "$AGENT_HOME/.created-by-caddyweb-agent"
+else
+	# SSH runs the forced command through the user's shell, so it can't be nologin.
+	case "$(getent passwd "$AGENT_USER" | cut -d: -f7)" in
+	*nologin | */false) usermod -s /bin/sh "$AGENT_USER" ;;
+	esac
 fi
 # '*' = no password at all (key login only). A '!' lock would make some SSH
 # servers refuse the key as well.

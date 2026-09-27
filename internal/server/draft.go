@@ -27,17 +27,39 @@ func shaOf(s string) string {
 // syncLive reads the Caddyfile from the server (at most every few seconds
 // unless force is set) and caches it.
 func (sc *serverCtx) syncLive(ctx context.Context, force bool) (store.Live, *remote.CaddyError) {
-	sc.cacheMu.Lock()
-	defer sc.cacheMu.Unlock()
 	cached := sc.st.Live()
 	if !sc.client.Config().Configured() {
 		return cached, &remote.CaddyError{Kind: "notconfigured", Message: "CaddyWeb is not connected to a Caddy server yet."}
 	}
-	if !force && time.Since(sc.lastFetch) < 3*time.Second {
-		return cached, sc.liveErr
+	sc.cacheMu.Lock()
+	liveErr, last := sc.liveErr, sc.lastFetch
+	sc.cacheMu.Unlock()
+	// Re-read at most every few seconds; back off longer while the server is
+	// unreachable so one offline machine can't slow every page down.
+	wait := 3 * time.Second
+	if liveErr != nil && (liveErr.Kind == "connection" || liveErr.Kind == "hostkey") {
+		wait = 20 * time.Second
 	}
+	if !force && time.Since(last) < wait {
+		return cached, liveErr
+	}
+	// Only one read at a time. Other (non-forced) callers get the cache
+	// instead of queueing behind a slow connection.
+	if force {
+		sc.fetchMu.Lock()
+	} else if !sc.fetchMu.TryLock() {
+		return cached, liveErr
+	}
+	defer sc.fetchMu.Unlock()
+
+	// Don't let a browser that navigates away cancel the read: the result is
+	// cached and shared with every other request.
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	text, err := sc.client.Read(rctx)
+	sc.cacheMu.Lock()
+	defer sc.cacheMu.Unlock()
 	sc.lastFetch = time.Now()
-	text, err := sc.client.Read(ctx)
 	if err != nil {
 		sc.liveErr = remote.Explain(err)
 		return cached, sc.liveErr
@@ -122,15 +144,21 @@ type stateView struct {
 
 func (sc *serverCtx) cachedInfo(ctx context.Context) *remote.Info {
 	sc.cacheMu.Lock()
-	defer sc.cacheMu.Unlock()
-	if sc.info != nil && time.Since(sc.infoAt) < time.Minute {
-		return sc.info
+	info, at := sc.info, sc.infoAt
+	sc.cacheMu.Unlock()
+	if info != nil && time.Since(at) < time.Minute {
+		return info
 	}
-	info, err := sc.client.Info(ctx)
-	if err == nil {
-		sc.info, sc.infoAt = info, time.Now()
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	fresh, err := sc.client.Info(rctx)
+	if err != nil {
+		return info
 	}
-	return sc.info
+	sc.cacheMu.Lock()
+	sc.info, sc.infoAt = fresh, time.Now()
+	sc.cacheMu.Unlock()
+	return fresh
 }
 
 func (sc *serverCtx) buildState(ctx context.Context, u *store.User, live store.Live, liveErr *remote.CaddyError, d store.Draft) stateView {

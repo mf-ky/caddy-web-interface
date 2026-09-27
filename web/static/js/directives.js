@@ -2,7 +2,7 @@
 // PLACE (tokens / block), so anything it doesn't understand — comments,
 // unusual options — is left exactly as it was.
 
-import { h, icon, field, toggle, select, api, toast, modal } from './lib.js';
+import { h, icon, field, toggle, select, api, toast, modal, fill } from './lib.js';
 import {
   quote, unquote, dir, blockDir, name, args, directives, find, findAll, splitMatcher, isMatcher,
   serializeNode, PROXY_HEADER_PRESETS, RESPONSE_HEADER_PRESETS, LB_POLICIES,
@@ -17,7 +17,7 @@ function input(value, onInput, attrs = {}) {
 export function listEditor(items, onChange, { placeholder = '', addLabel = 'Add', min = 0, datalist } = {}) {
   const wrap = h('div', { class: 'list-editor' });
   const render = () => {
-    wrap.replaceChildren(
+    fill(wrap, 
       ...items.map((v, i) => h('div', { class: 'list-row' },
         input(v, (nv) => { items[i] = nv; onChange(items, false); }, { placeholder, class: 'mono', list: datalist }),
         items.length > min ? h('button', { class: 'icon-btn', type: 'button', title: 'Remove', 'aria-label': 'Remove', onclick: () => { items.splice(i, 1); onChange(items, true); render(); } }, icon('x')) : null)),
@@ -54,7 +54,7 @@ function otherOptions(node, known, ctx, title = 'Other options') {
   const box = h('div', { class: 'other-options' });
   const render = () => {
     const others = (node.block || []).filter((c) => c.__raw !== undefined || c.type === 'comment' || !known(c));
-    box.replaceChildren(
+    fill(box, 
       others.length ? h('div', { class: 'sub-label' }, title) : null,
       ...others.map((c) => h('div', { class: 'list-row' },
         c.type === 'comment'
@@ -85,7 +85,7 @@ function reverseProxyEditor(node, ctx) {
     const headerRows = () => (node.block || []).filter((c) => ['header_up', 'header_down'].includes(name(c)) && !PROXY_HEADER_PRESETS.some((p) => p.match(c)));
     const customHeaders = h('div', { class: 'stack-sm' });
     const renderHeaders = () => {
-      customHeaders.replaceChildren(
+      fill(customHeaders, 
         ...headerRows().map((c) => {
           const a = args(c);
           const set = (dirName, field, ...vals) => { c.tokens = [dirName, quote(field), ...vals.filter((v) => v !== '').map(quote)]; };
@@ -99,7 +99,7 @@ function reverseProxyEditor(node, ctx) {
     };
     renderHeaders();
 
-    wrap.replaceChildren(
+    fill(wrap, 
       field(ups.length > 1 ? 'Backends (load balanced)' : 'Send traffic to',
         listEditor(ups, (list, structural) => { setUps(list); if (structural) render(); }, { placeholder: '192.168.0.10:8080  or  https://192.168.0.10:8443', addLabel: 'Add another backend (load balancing)', min: 1 }),
         'IP or host name with port. Start with https:// if the app itself uses HTTPS.'),
@@ -230,7 +230,7 @@ function headerEditor(node, ctx) {
     if (!node.block) node.block = [];
     const rows = node.block.filter((c) => c.type === 'directive' && c.__raw === undefined);
     const presetOn = (p) => rows.some((c) => unquote(c.tokens[0]).toLowerCase() === p.field.toLowerCase() && (p.value === '' || args({ tokens: ['x', ...c.tokens.slice(1)] }).join(' ') === p.value));
-    wrap.replaceChildren(
+    fill(wrap, 
       h('p', { class: 'muted' }, 'Headers added to every response sent to visitors.'),
       h('div', { class: 'presets' }, RESPONSE_HEADER_PRESETS.map((p) => h('label', { class: 'preset' },
         h('input', { type: 'checkbox', checked: presetOn(p), onchange: (e) => {
@@ -260,7 +260,7 @@ function basicAuthEditor(node, ctx) {
   if (!node.block) node.block = [];
   const render = () => {
     const users = node.block.filter((c) => c.type === 'directive' && c.__raw === undefined);
-    wrap.replaceChildren(
+    fill(wrap, 
       h('p', { class: 'muted' }, 'Visitors must enter a username and password before they see the site. Passwords are stored as secure hashes, never in plain text.'),
       ...users.map((c) => h('div', { class: 'header-row header-row-2' },
         input(unquote(c.tokens[0]), (v) => { c.tokens[0] = quote(v); }, { placeholder: 'username' }),

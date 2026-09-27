@@ -59,7 +59,9 @@ type AgentError struct {
 
 func (e *AgentError) Error() string {
 	msg := strings.TrimSpace(e.Stderr)
-	if msg == "" {
+	if msg == "" && e.Code < 0 {
+		msg = "the agent was stopped before it finished (timeout)"
+	} else if msg == "" {
 		msg = fmt.Sprintf("agent exited with code %d", e.Code)
 	}
 	return msg
@@ -129,11 +131,14 @@ func (c *Client) Run(ctx context.Context, stdin []byte, args ...string) ([]byte,
 	if cfg.Mode == "local" {
 		return runLocal(ctx, cfg, stdin, args)
 	}
+	c.mu.Lock()
+	hadConn := c.conn != nil
+	c.mu.Unlock()
 	out, err := c.runSSH(ctx, stdin, args)
 	var ae *AgentError
 	var hk *HostKeyError
-	if err != nil && !errors.As(err, &ae) && !errors.As(err, &hk) {
-		// connection may have gone stale; retry once on a fresh one
+	if err != nil && hadConn && !errors.As(err, &ae) && !errors.As(err, &hk) {
+		// the kept-open connection may have gone stale; retry once on a fresh one
 		c.dropConn()
 		out, err = c.runSSH(ctx, stdin, args)
 	}
@@ -217,9 +222,9 @@ func dial(ctx context.Context, cfg Config, signer ssh.Signer) (*ssh.Client, stri
 			}
 			return nil
 		},
-		Timeout: 10 * time.Second,
+		Timeout: 8 * time.Second,
 	}
-	d := net.Dialer{Timeout: 10 * time.Second}
+	d := net.Dialer{Timeout: 6 * time.Second}
 	nc, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, "", fmt.Errorf("cannot reach %s: %w", addr, err)

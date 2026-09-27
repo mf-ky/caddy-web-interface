@@ -187,6 +187,9 @@ func Explain(err error) *CaddyError {
 	}
 	detail := cleanCaddyOutput(ae.Stderr)
 	ce := &CaddyError{Detail: detail, Message: summarize(detail)}
+	if ce.Message == "" {
+		ce.Message = ae.Error()
+	}
 	switch ae.Code {
 	case ExitInvalid:
 		ce.Kind = "invalid"

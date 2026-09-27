@@ -23,8 +23,9 @@ type serverCtx struct {
 	client *remote.Client
 
 	draftMu sync.Mutex // serialises draft edits, apply and restore
+	fetchMu sync.Mutex // one read of the live Caddyfile at a time
 
-	cacheMu   sync.Mutex
+	cacheMu   sync.Mutex // guards the fields below
 	info      *remote.Info
 	infoAt    time.Time
 	dns       []string
@@ -100,6 +101,7 @@ type serverSummary struct {
 	Conflict   bool               `json:"conflict"`
 	LastApply  *store.ApplyRecord `json:"lastApply,omitempty"`
 	Fetched    time.Time          `json:"fetched"`
+	Checking   bool               `json:"checking,omitempty"` // still waiting for the server to answer
 }
 
 func (s *Server) summarize(ctx context.Context, cfg store.ServerConfig) serverSummary {
@@ -156,19 +158,35 @@ func (s *Server) summarize(ctx context.Context, cfg store.ServerConfig) serverSu
 func (s *Server) handleServers(w http.ResponseWriter, r *http.Request, u *store.User) {
 	cfgs := s.state.Servers()
 	out := make([]serverSummary, len(cfgs))
-	var wg sync.WaitGroup
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	defer cancel()
+	type result struct {
+		i   int
+		sum serverSummary
+	}
+	results := make(chan result, len(cfgs))
 	for i, cfg := range cfgs {
-		wg.Add(1)
 		go func(i int, cfg store.ServerConfig) {
-			defer wg.Done()
-			out[i] = s.summarize(ctx, cfg)
+			results <- result{i, s.summarize(context.WithoutCancel(r.Context()), cfg)}
 		}(i, cfg)
 	}
-	wg.Wait()
-	if u.Role != store.RoleAdmin {
-		for i := range out {
+	// Answer quickly: servers that are slow to respond are reported as
+	// "checking" and the page asks again a moment later.
+	got := make([]bool, len(cfgs))
+	deadline := time.After(2500 * time.Millisecond)
+wait:
+	for n := 0; n < len(cfgs); n++ {
+		select {
+		case res := <-results:
+			out[res.i], got[res.i] = res.sum, true
+		case <-deadline:
+			break wait
+		}
+	}
+	for i, cfg := range cfgs {
+		if !got[i] {
+			out[i] = serverSummary{ID: cfg.ID, Name: cfg.Name, Mode: cfg.Connection.Mode, Host: cfg.Connection.Host, Port: cfg.Connection.Port,
+				User: cfg.Connection.User, Trusted: cfg.Connection.HostKey != "", Configured: cfg.Connection.Configured(), Checking: true}
+		}
+		if u.Role != store.RoleAdmin {
 			out[i].AgentPath = ""
 		}
 	}

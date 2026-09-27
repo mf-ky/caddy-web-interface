@@ -1,0 +1,21 @@
+# CaddyWeb with Docker Compose:
+#   docker compose up -d --build
+# Then open http://<this-machine>:8090
+#
+# Reset a forgotten password:
+#   docker exec -it caddyweb caddyweb user passwd <name>
+services:
+  caddyweb:
+    build: .
+    image: caddyweb:local
+    container_name: caddyweb
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    volumes:
+      - caddyweb-data:/data
+    environment:
+      - TZ=Etc/UTC
+
+volumes:
+  caddyweb-data:

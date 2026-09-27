@@ -1,0 +1,24 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install Caddy (for the end-to-end test)
+        run: |
+          curl -fsSL -o caddy.tgz https://github.com/caddyserver/caddy/releases/download/v2.10.2/caddy_2.10.2_linux_amd64.tar.gz
+          tar xzf caddy.tgz caddy && sudo mv caddy /usr/local/bin/
+      - run: go vet ./...
+      - run: go test ./...
+      - name: Check shell scripts
+        run: bash -n agent/caddyweb-agent agent/install-agent.sh scripts/install.sh
+      - name: Check JavaScript syntax
+        run: for f in web/static/js/*.js web/static/js/views/*.js; do node --check "$f"; done
