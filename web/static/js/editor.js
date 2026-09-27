@@ -35,15 +35,17 @@ function itemCard(node, nodes, ctx, rerender) {
     } else if (rawMode) {
       body.append(rawEditor(node, ctx));
     } else {
-      const siblings = { ...ctx, hasRoot: !!find(nodes, 'root'), blockEditor };
+      const siblings = { ...ctx, hasRoot: ctx.hasRoot || !!find(nodes, 'root'), blockEditor };
       body.append(d.editor(node, siblings));
     }
   };
   renderBody();
   const idx = () => nodes.indexOf(node);
   const move = (delta) => {
+    // swap with the next *visible* item (hidden ones, like tls, stay put)
     const i = idx();
-    const j = i + delta;
+    let j = i + delta;
+    while (j >= 0 && j < nodes.length && ctx.hideNode && ctx.hideNode(nodes[j], nodes)) j += delta;
     if (j < 0 || j >= nodes.length) return;
     [nodes[i], nodes[j]] = [nodes[j], nodes[i]];
     rerender();
@@ -74,7 +76,7 @@ function addButton(nodes, ctx, rerender) {
     const groups = {};
     for (const [key, d] of Object.entries(DIRECTIVES)) {
       if (d.hidden || !d.make) continue;
-      (groups[d.group] ||= []).push({ label: d.label, desc: d.desc, icon: d.icon, make: () => [d.make()] });
+      (groups[d.group] ||= []).push({ label: d.label, desc: d.desc, icon: d.icon, make: () => [d.make(ctx)] });
     }
     for (const r of RECIPES) (groups[r.group] ||= []).unshift({ label: r.label, desc: r.desc, icon: r.icon, make: r.make });
     groups.Other.push({ label: 'Caddyfile text', desc: 'Type any directive by hand.', icon: 'code', make: () => [{ type: 'directive', tokens: [], block: null, __raw: '' }] });
@@ -94,7 +96,8 @@ function addButton(nodes, ctx, rerender) {
 function tlsMode(work) {
   const t = find(work.nodes, 'tls');
   const addrs = addresses(work);
-  if (addrs.length && addrs.every((a) => a.startsWith('http://'))) return 'http';
+  if (work.__http === true) return 'http';
+  if (work.__http === undefined && addrs.length && addrs.every((a) => a.startsWith('http://'))) return 'http';
   if (!t) return 'auto';
   const a = args(t);
   if (a[0] === 'internal' && !t.block) return 'internal';
@@ -115,6 +118,7 @@ function certSection(work, ctx, onAddrChange) {
       if (m === 'internal') work.nodes.unshift(dir('tls', 'internal'));
       if (m === 'custom') work.nodes.unshift(dir('tls', '/etc/caddy/certs/site.crt', '/etc/caddy/certs/site.key'));
       if (m === 'dns') work.nodes.unshift(blockDir('tls', [], [buildProvider('dns', ctx.globalProvider || 'cloudflare', {})]));
+      work.__http = m === 'http';
       if (m === 'http') work.header = work.header.map((h0) => (h0.includes('://') ? h0 : 'http://' + h0));
       if (m === 'advanced') work.nodes.unshift(blockDir('tls', [], []));
       onAddrChange();
@@ -162,10 +166,10 @@ function providerForm(node, keyword, ctx, onReplace) {
     const installed = ctx.dnsInstalled || [];
     const known = DNS_PROVIDERS.map((x) => [x.id, x.name + (installed.includes(x.id) ? '  ✓ installed' : '')]);
     if (cur.id && !p) known.unshift([cur.id, cur.id + ' (other)']);
-    const update = () => onReplace(node = buildProvider(keyword, cur.id, cur.values, cur.extraArgs));
+    const update = () => onReplace(node = buildProvider(keyword, cur.id, cur.values, cur.extraArgs, cur.extra || [], { comment: cur.comment, blank: cur.blank }));
     const missing = cur.id && ctx.dnsChecked && !installed.includes(cur.id);
     fill(wrap, 
-      field('DNS provider', select([['', 'Choose your DNS provider…'], ...known], cur.id, (v) => { cur = { id: v, values: {}, extraArgs: [] }; update(); render(); })),
+      field('DNS provider', select([['', 'Choose your DNS provider…'], ...known], cur.id, (v) => { cur = { id: v, values: {}, extraArgs: [], extra: [], comment: cur.comment, blank: cur.blank }; update(); render(); })),
       missing ? h('div', { class: 'callout callout-warn' }, icon('alert'), h('div', null,
         h('strong', null, `The ${p ? p.name : cur.id} module isn’t installed in your Caddy.`),
         h('p', null, 'Caddy needs a plugin for each DNS provider. On the Caddy server run:'),
@@ -178,6 +182,7 @@ function providerForm(node, keyword, ctx, onReplace) {
           h('button', { class: 'icon-btn', type: 'button', title: 'Show', 'aria-label': 'Show or hide', onclick: () => { inp.type = inp.type === 'password' ? 'text' : 'password'; } }, icon('eye'))) : inp,
         secret ? 'Tip: you can write {env.MY_VARIABLE} to read the value from an environment variable instead.' : null);
       }),
+      (cur.extra || []).length ? h('p', { class: 'muted small' }, `${cur.extra.length} more option(s) for this provider are kept as they are (see the “Caddyfile text” tab).`) : null,
       cur.id && !p ? h('p', { class: 'muted' }, 'Unknown provider — edit its settings as Caddyfile text on the “Caddyfile text” tab.') : null);
   };
   render();
@@ -239,13 +244,13 @@ function globalForm(work, ctx) {
     const i = nodes.findIndex((n) => name(n) === nm);
     if (value === null || value === '') { if (i >= 0) nodes.splice(i, 1); return; }
     const n = dir(nm, ...(argsList || [value]));
-    if (i >= 0) { n.comment = nodes[i].comment; n.blank = nodes[i].blank; nodes[i] = n; } else nodes.unshift(n);
+    if (i >= 0) { n.comment = nodes[i].comment; n.blank = nodes[i].blank; n.block = nodes[i].block; nodes[i] = n; } else nodes.unshift(n);
   };
   const email = find(nodes, 'email');
   const ca = find(nodes, 'acme_ca');
   const admin = find(nodes, 'admin');
   const caVal = ca ? args(ca)[0] : '';
-  const adminVal = admin ? args(admin)[0] : 'localhost:2019';
+  const adminVal = (admin && args(admin)[0]) || 'localhost:2019';
 
   const providerHost = h('div');
   const renderProvider = () => {
@@ -256,7 +261,7 @@ function globalForm(work, ctx) {
         else { const i = nodes.findIndex((n) => name(n) === 'acme_dns'); if (i >= 0) nodes.splice(i, 1); }
         renderProvider();
       }, 'Needed for wildcard certificates, or when your sites aren’t reachable from the internet on ports 80/443. Without it, Caddy uses the normal HTTP check.'),
-      node ? providerForm(node, 'acme_dns', ctx, (n) => { const i = nodes.findIndex((x) => name(x) === 'acme_dns'); n.comment = nodes[i].comment; nodes[i] = n; }) : null);
+      node ? providerForm(node, 'acme_dns', ctx, (n) => { const i = nodes.findIndex((x) => name(x) === 'acme_dns'); nodes[i] = n; }) : null);
   };
   renderProvider();
 
@@ -297,9 +302,10 @@ export function openEditor({ seg, isNew = false, readOnly = false, ctx }) {
   work.nodes ||= [];
   let mode = 'form';
   let rawText = null;
+  let rawAtSwitch = null;
   const type = work.kind === 'site' ? classify(work) : work.kind;
   const t = TYPES[type] || TYPES.custom;
-  const ectx = { ...ctx, firstAddress: addresses(work)[0] };
+  const ectx = { ...ctx, firstAddress: addresses(work)[0], getAddress: () => addresses(work)[0] };
 
   const body = h('div', { class: 'editor' });
   const tabs = h('div', { class: 'tabs', role: 'tablist' });
@@ -331,6 +337,7 @@ export function openEditor({ seg, isNew = false, readOnly = false, ctx }) {
       if (m === 'text') {
         const r = await api('POST', ctx.base + '/draft/preview', { segment: toPayload(work) });
         rawText = r.text;
+        rawAtSwitch = r.text;
       } else {
         const r = await api('POST', ctx.base + '/draft/preview', { text: rawText });
         const s = r.segment;
@@ -398,7 +405,7 @@ export function openEditor({ seg, isNew = false, readOnly = false, ctx }) {
     h('div', { class: 'drawer-title' },
       h('div', { class: 'eyebrow' }, isNew ? 'New ' + t.label : t.label, status),
       h('h2', null, isNew ? 'Set up your ' + t.label.toLowerCase() : segTitle(seg))),
-    h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Close', onclick: () => d.close() }, icon('x')));
+    h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Close', onclick: () => d.requestClose() }, icon('x')));
 
   const saveBtn = h('button', { class: 'btn btn-primary', type: 'button' }, icon('check'), isNew ? 'Add to draft' : 'Save to draft');
   saveBtn.addEventListener('click', () => save(saveBtn));
@@ -426,10 +433,13 @@ export function openEditor({ seg, isNew = false, readOnly = false, ctx }) {
     h('span', { class: 'spacer' }),
     canCopy ? h('button', { class: 'btn btn-sm btn-ghost', type: 'button', title: 'Copy this card to another server', onclick: copyTo }, icon('copy'), 'Copy to…') : null,
     !readOnly ? h('button', { class: 'btn btn-sm btn-ghost', type: 'button', onclick: preview }, icon('eye'), 'Preview') : null,
-    h('button', { class: 'btn', type: 'button', onclick: () => d.close() }, readOnly ? 'Close' : 'Cancel'),
+    h('button', { class: 'btn', type: 'button', onclick: () => d.requestClose() }, readOnly ? 'Close' : 'Cancel'),
     !readOnly ? saveBtn : null);
 
-  const d = drawer({ title: segTitle(seg), header: h('div', null, header, tabs), body, footer });
+  const snapshot = JSON.stringify(toPayload(work));
+  const dirty = () => !readOnly && (JSON.stringify(toPayload(work)) !== snapshot || (mode === 'text' && rawText !== rawAtSwitch));
+  const d = drawer({ title: segTitle(seg), header: h('div', null, header, tabs), body, footer,
+    beforeClose: async () => !dirty() || confirmDialog('Discard your changes?', 'You have changes in this card that aren’t saved to the draft yet.', { confirm: 'Discard changes', danger: true }) });
   if (readOnly && !seg.canEdit && ctx.role === 'power') {
     body.before(h('div', { class: 'callout callout-info drawer-note' }, icon('info'), h('span', null, 'Power users can view every card and add new ones. Only an admin can change cards that are already live.')));
   }

@@ -504,10 +504,12 @@ ol.steps > li::before { content: counter(step); position: absolute; left: 0; top
 .template small { color: var(--text-2); font-size: 0.82rem; line-height: 1.4; }
 
 /* code */
-.codeblock { position: relative; }
-.codeblock pre { margin: 0; padding: 12px 44px 12px 14px; background: var(--surface-3); border: 1px solid var(--border); border-radius: 11px; overflow-x: auto; font-size: 0.85rem; line-height: 1.55; }
+.codeblock { display: flex; align-items: flex-start; gap: 4px; background: var(--surface-3); border: 1px solid var(--border); border-radius: 11px; min-width: 0; max-width: 100%; }
+.codeblock pre { flex: 1; min-width: 0; margin: 0; padding: 12px 6px 12px 14px; overflow-x: auto; font-size: 0.85rem; line-height: 1.55; tab-size: 4; }
 .codeblock.code-lg pre { max-height: 60vh; }
-.copy-btn { position: absolute; top: 6px; right: 6px; width: 30px; height: 30px; }
+.copy-btn { flex: none; margin: 6px 6px 0 0; width: 30px; height: 30px; }
+.callout > div, .callout > span { min-width: 0; }
+.code-view, .diff, .code-context, textarea.raw { tab-size: 4; }
 .code-view { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 12px 0; overflow-x: auto; font-family: var(--mono); font-size: 0.86rem; line-height: 1.6; }
 .code-line { display: flex; padding-right: 16px; min-width: max-content; }
 .code-line:hover { background: var(--surface-2); }
@@ -657,11 +659,17 @@ ol.steps > li::before { content: counter(step); position: absolute; left: 0; top
   .server-title .btn { height: 32px; padding: 0 8px; }
   .subtabs { margin-top: 12px; }
   .global-card { padding: 16px; }
-  .global-facts { grid-template-columns: 1fr 1fr; gap: 8px; }
+  .global-facts { grid-template-columns: 1fr; gap: 8px; }
+  .nav-link span { display: none; }
+  .nav { order: 0; flex-basis: auto; flex: 1; justify-content: center; }
+  .brand-name { font-size: 1rem; }
   .fact { padding: 9px; }
   .toolbar .spacer { display: none; }
   .toolbar .btn-primary { margin-left: auto; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+@media (max-width: 420px) {
+  .brand-text { display: none; }
 }

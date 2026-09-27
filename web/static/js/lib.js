@@ -148,10 +148,22 @@ export function toast(message, kind = 'ok', timeout = 4500) {
 // ---- modal & drawer ----
 let openLayers = [];
 
+const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])';
+
 function trapKeys(e) {
   const top = openLayers[openLayers.length - 1];
   if (!top) return;
-  if (e.key === 'Escape' && top.dismissible) { e.preventDefault(); top.close(); }
+  if (e.key === 'Escape' && top.dismissible) { e.preventDefault(); top.close(); return; }
+  if (e.key === 'Tab' && top.el) {
+    // keep keyboard focus inside the open dialog
+    const items = [...top.el.querySelectorAll(FOCUSABLE)].filter((x) => x.offsetParent !== null);
+    if (!items.length) return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    if (!top.el.contains(document.activeElement)) { e.preventDefault(); first.focus(); }
+    else if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  }
 }
 document.addEventListener('keydown', trapKeys);
 
@@ -159,15 +171,21 @@ document.addEventListener('keydown', trapKeys);
  * modal({title, body, actions:[{label, kind, onClick, keepOpen}], wide, dismissible})
  * returns {close, el}
  */
-export function modal({ title, body, actions = [], wide = false, dismissible = true, className = '' }) {
+export function modal({ title, body, actions = [], wide = false, dismissible = true, className = '', onClose }) {
   const backdrop = h('div', { class: 'backdrop' });
   const box = h('div', { class: 'modal ' + (wide ? 'modal-wide ' : '') + className, role: 'dialog', 'aria-modal': 'true', 'aria-label': title });
-  const layer = { dismissible, close: () => {} };
+  const layer = { dismissible, close: () => {}, el: box };
+  const opener = document.activeElement;
+  let closed = false;
   const close = () => {
+    if (closed) return;
+    closed = true;
     backdrop.classList.remove('show');
     openLayers = openLayers.filter((l) => l !== layer);
     setTimeout(() => backdrop.remove(), 200);
     if (!openLayers.length) document.body.classList.remove('noscroll');
+    if (opener && opener.focus && document.body.contains(opener)) opener.focus();
+    if (onClose) onClose();
   };
   layer.close = close;
   const footer = h('div', { class: 'modal-actions' });
@@ -216,19 +234,33 @@ export function confirmDialog(title, text, { confirm = 'Confirm', danger = false
   });
 }
 
-/** drawer({title, body, footer}) — a side sheet used by the card editor */
-export function drawer({ title, header, body, footer, onClose }) {
+/**
+ * drawer({title, header, body, footer, beforeClose}) — a side sheet used by the
+ * card editor. beforeClose() may return false (or a Promise of false) to keep
+ * it open, e.g. to ask about unsaved changes. Returns {close (forced),
+ * requestClose (asks beforeClose first)}.
+ */
+export function drawer({ title, header, body, footer, onClose, beforeClose }) {
   const backdrop = h('div', { class: 'backdrop drawer-backdrop' });
   const panel = h('aside', { class: 'drawer', role: 'dialog', 'aria-modal': 'true', 'aria-label': title || 'Editor' });
-  const layer = { dismissible: true, close: () => {} };
+  const layer = { dismissible: true, close: () => {}, el: panel };
+  const opener = document.activeElement;
+  let closed = false;
   const close = () => {
+    if (closed) return;
+    closed = true;
     backdrop.classList.remove('show');
     openLayers = openLayers.filter((l) => l !== layer);
     setTimeout(() => backdrop.remove(), 250);
     if (!openLayers.length) document.body.classList.remove('noscroll');
+    if (opener && opener.focus && document.body.contains(opener)) opener.focus();
     if (onClose) onClose();
   };
-  layer.close = () => close();
+  const requestClose = async () => {
+    if (beforeClose && (await beforeClose()) === false) return;
+    close();
+  };
+  layer.close = requestClose;
   append(panel, [header, h('div', { class: 'drawer-body' }, body), footer]);
   backdrop.appendChild(panel);
   backdrop.addEventListener('mousedown', (e) => { if (e.target === backdrop) layer.close(); });
@@ -236,7 +268,8 @@ export function drawer({ title, header, body, footer, onClose }) {
   document.body.classList.add('noscroll');
   openLayers.push(layer);
   requestAnimationFrame(() => backdrop.classList.add('show'));
-  return { close, layer, el: panel };
+  setTimeout(() => { const f = panel.querySelector('.drawer-body ' + FOCUSABLE) || panel.querySelector(FOCUSABLE); if (f) f.focus({ preventScroll: true }); }, 80);
+  return { close, requestClose, layer, el: panel };
 }
 
 // ---- formatting ----

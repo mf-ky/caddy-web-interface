@@ -10,12 +10,13 @@ export function quote(v) {
   if (v === '') return '""';
   if (/^[^\s"'`#{}]+$/.test(v) || /^\{[^\s{}]+\}$/.test(v)) return v;
   if (/^[^\s"`#]+$/.test(v) && !/^[{}]$/.test(v) && !v.startsWith('#')) return v; // e.g. {host}:443 or /path/{x}
-  return '"' + v.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+  // Inside quotes Caddy only treats \" as an escape; backslashes stay as typed.
+  return '"' + v.replace(/"/g, '\\"') + '"';
 }
 
 export function unquote(t) {
   if (t == null) return '';
-  if (t.length >= 2 && t[0] === '"' && t[t.length - 1] === '"') return t.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+  if (t.length >= 2 && t[0] === '"' && t[t.length - 1] === '"') return t.slice(1, -1).replace(/\\"/g, '"');
   if (t.length >= 2 && t[0] === '`' && t[t.length - 1] === '`') return t.slice(1, -1);
   return t;
 }
@@ -40,10 +41,26 @@ export const findAll = (nodes, nm) => directives(nodes).filter((n) => n.tokens[0
 
 /** splitMatcher(node) → {matcher, rest[]} for directives whose first arg may be a matcher */
 export function splitMatcher(node) {
+  if (!node) return { matcher: '', rest: [] };
   const t = node.tokens.slice(1);
   let matcher = '';
-  if (t.length && isMatcher(t[0])) matcher = t.shift();
+  // "root /srv" has one argument, which is the path — not a matcher
+  const single = ['root', 'redir', 'rewrite', 'try_files'].includes(node.tokens[0]) && t.length === 1;
+  if (t.length && isMatcher(t[0]) && !single) matcher = t.shift();
   return { matcher, rest: t.map(unquote) };
+}
+
+/** Find a directive here or inside handle/handle_path/route blocks. */
+export function findDeep(nodes, nm) {
+  const direct = find(nodes, nm);
+  if (direct) return direct;
+  for (const n of directives(nodes)) {
+    if (['handle', 'handle_path', 'route'].includes(n.tokens[0]) && n.block) {
+      const inner = findDeep(n.block, nm);
+      if (inner) return inner;
+    }
+  }
+  return undefined;
 }
 
 // ---- serialization (mirrors the Go formatter) ----
@@ -107,7 +124,8 @@ export const TYPES = {
   global: { label: 'Global Settings', icon: 'settings', color: 'global' },
 };
 
-function upstreamsOf(rp) {
+export function upstreamsOf(rp) {
+  if (!rp) return [];
   const { rest } = splitMatcher(rp);
   const ups = [...rest];
   for (const to of findAll(rp.block, 'to')) ups.push(...args(to));
@@ -154,28 +172,30 @@ export function summarize(seg) {
   const ds = directives(seg.nodes);
   const walk = (nodes, fn, parents = []) => (nodes || []).forEach((n) => { fn(n, parents); if (n.block) walk(n.block, fn, [...parents, n]); });
 
-  const rp = find(seg.nodes, 'reverse_proxy');
+  const deep = (nm) => (type === 'routes' ? find(seg.nodes, nm) : findDeep(seg.nodes, nm));
+  const rp = deep('reverse_proxy');
   if (type === 'proxy' || type === 'loadbalancer') {
     for (const u of upstreamsOf(rp)) targets.push({ icon: 'server', text: u });
   } else if (type === 'files' || type === 'spa') {
-    const root = find(seg.nodes, 'root');
+    const root = deep('root');
     targets.push({ icon: 'folder', text: root ? splitMatcher(root).rest[0] || '(current folder)' : '(current folder)' });
   } else if (type === 'php') {
-    const root = find(seg.nodes, 'root');
-    const php = find(seg.nodes, 'php_fastcgi');
-    if (root) targets.push({ icon: 'folder', text: splitMatcher(root).rest[0] });
+    const root = deep('root');
+    const php = deep('php_fastcgi');
+    if (root) targets.push({ icon: 'folder', text: splitMatcher(root).rest[0] || '(current folder)' });
     if (php) targets.push({ icon: 'server', text: splitMatcher(php).rest.join(' ') });
   } else if (type === 'redirect') {
-    const r = find(seg.nodes, 'redir');
+    const r = deep('redir');
     const { matcher, rest } = splitMatcher(r);
     targets.push({ icon: 'redirect', text: (matcher ? matcher + ' → ' : '') + (rest[0] || '') });
     if (rest[1]) chips.push(codeLabel(rest[1]));
   } else if (type === 'respond') {
-    const r = find(seg.nodes, 'respond');
+    const r = deep('respond');
     const { rest } = splitMatcher(r);
     const body = rest.find((x) => !/^\d{3}$/.test(x));
     const code = rest.find((x) => /^\d{3}$/.test(x));
-    targets.push({ icon: 'message', text: body ? '“' + (body.length > 40 ? body.slice(0, 40) + '…' : body) + '”' : 'Empty response', mono: false });
+    const shown = body && body.startsWith('<<') ? 'multi-line text' : body;
+    targets.push({ icon: 'message', text: shown ? '“' + (shown.length > 40 ? shown.slice(0, 40) + '…' : shown) + '”' : 'Empty response', mono: false });
     if (code) chips.push('Status ' + code);
   } else if (type === 'routes') {
     for (const hd of ds.filter((d) => ['handle', 'handle_path', 'route'].includes(d.tokens[0]))) {
@@ -362,27 +382,37 @@ export function readProvider(node) {
   const a = args(node);
   const id = a[0] || '';
   const p = providerById(id);
+  const known = new Set(p ? p.fields.map(([k]) => k) : []);
   const values = {};
+  const extra = []; // sub-options the form doesn't show, kept verbatim
   if (p && (p.single || p.positional)) {
     p.fields.forEach(([k], i) => { if (a[i + 1] !== undefined) values[k] = a[i + 1]; });
   }
-  for (const c of directives(node.block)) values[c.tokens[0]] = args(c).join(' ');
-  return { id, values, extraArgs: p ? [] : a.slice(1) };
+  for (const c of node.block || []) {
+    if (c.type === 'directive' && c.__raw === undefined && known.has(c.tokens[0]) && c.tokens.length === 2 && !c.block) values[c.tokens[0]] = args(c)[0];
+    else extra.push(c);
+  }
+  const extraArgs = p ? (p.single && a.length > 2 ? a.slice(2) : []) : a.slice(1);
+  return { id, values, extra, extraArgs, comment: node.comment, blank: node.blank };
 }
 
 /** Build the provider directive (keyword is 'acme_dns' globally or 'dns' inside tls). */
-export function buildProvider(keyword, id, values, extraArgs = []) {
+export function buildProvider(keyword, id, values, extraArgs = [], extra = [], meta = {}) {
   const p = providerById(id);
+  let n;
   if (!p) {
-    const n = dir(keyword, id, ...extraArgs);
-    const entries = Object.entries(values).filter(([, v]) => v !== '');
-    if (entries.length) n.block = entries.map(([k, v]) => dir(k, v));
-    return n;
+    n = { type: 'directive', tokens: [keyword, quote(id), ...extraArgs.map(quote)], block: null };
+  } else if (p.positional) {
+    n = dir(keyword, id, ...p.fields.map(([k]) => values[k] || ''));
+  } else if (p.single && !extra.length) {
+    n = dir(keyword, id, values[p.fields[0][0]] || '', ...extraArgs);
+  } else {
+    n = dir(keyword, id);
+    n.block = p.fields.filter(([k]) => (values[k] || '') !== '').map(([k]) => dir(k, values[k]));
   }
-  if (p.positional) return dir(keyword, id, ...p.fields.map(([k]) => values[k] || ''));
-  if (p.single) return dir(keyword, id, values[p.fields[0][0]] || '');
-  const n = dir(keyword, id);
-  n.block = p.fields.filter(([k]) => (values[k] || '') !== '').map(([k]) => dir(k, values[k]));
+  if (extra.length) n.block = [...(n.block || []), ...extra];
+  if (meta.comment) n.comment = meta.comment;
+  if (meta.blank) n.blank = meta.blank;
   return n;
 }
 

@@ -83,16 +83,16 @@ func (sc *serverCtx) currentDraft(live store.Live) store.Draft {
 		// first run (or a draft that never had a real starting point): start
 		// from the live file
 		d.Text, d.BaseSHA, changed = live.Text, live.SHA, true
-		d.Log, d.Creators = nil, map[string]string{}
+		d.Log, d.Creators, d.Renamed = nil, map[string]string{}, nil
 	case shaOf(d.Text) == live.SHA && (d.BaseSHA != live.SHA || len(d.Log) > 0 || len(d.Creators) > 0):
 		// draft matches the server (applied, or edited to the same result)
 		d.BaseSHA, changed = live.SHA, true
-		d.Log, d.Creators = nil, map[string]string{}
+		d.Log, d.Creators, d.Renamed = nil, map[string]string{}, nil
 	case d.BaseSHA != live.SHA && shaOf(d.Text) == d.BaseSHA:
 		// no pending edits, but the file changed on the server (e.g. from the
 		// CLI): follow it
 		d.Text, d.BaseSHA, changed = live.Text, live.SHA, true
-		d.Log, d.Creators = nil, map[string]string{}
+		d.Log, d.Creators, d.Renamed = nil, map[string]string{}, nil
 	}
 	if changed {
 		d.Rev++
@@ -114,6 +114,7 @@ type segView struct {
 	Text          string                `json:"text"`
 	Status        string                `json:"status"` // unchanged | new | modified | deleted
 	CreatedBy     string                `json:"createdBy,omitempty"`
+	RenamedFrom   string                `json:"renamedFrom,omitempty"` // key on the server before an address change
 	StartLine     int                   `json:"startLine"`
 	EndLine       int                   `json:"endLine"`
 	CanEdit       bool                  `json:"canEdit"`
@@ -209,7 +210,11 @@ func (sc *serverCtx) buildState(ctx context.Context, u *store.User, live store.L
 		sv := segToView(sg, doc.Indent, isAdmin)
 		sv.ID, sv.StartLine, sv.EndLine = i, lines[sg][0], lines[sg][1]
 		sv.CreatedBy = d.Creators[key]
-		if ls, ok := liveSegs[key]; !ok {
+		if from, ok := d.Renamed[key]; ok && liveSegs[from] != nil {
+			// an existing card whose address was changed
+			sv.Status, sv.RenamedFrom = "modified", from
+			present[from] = true
+		} else if ls, ok := liveSegs[key]; !ok {
 			sv.Status = "new"
 		} else if ls.Text(doc.Indent) != sg.Text(doc.Indent) {
 			sv.Status = "modified"
@@ -378,7 +383,7 @@ func (s *Server) mutateOpts(w http.ResponseWriter, r *http.Request, u *store.Use
 		d.Log = append(d.Log, change)
 	}
 	if shaOf(d.Text) == live.SHA {
-		d.Log, d.Creators = nil, map[string]string{}
+		d.Log, d.Creators, d.Renamed = nil, map[string]string{}, nil
 	}
 	if d.Creators == nil {
 		d.Creators = map[string]string{}
@@ -622,6 +627,19 @@ func (s *Server) replaceSegment(doc *caddyfile.Document, d *store.Draft, u *stor
 		delete(d.Creators, old.Key())
 		d.Creators[sg.Key()] = creator
 	}
+	if ok, nk := old.Key(), sg.Key(); ok != nk {
+		orig := ok
+		if o, was := d.Renamed[ok]; was {
+			orig = o
+		}
+		delete(d.Renamed, ok)
+		if d.Renamed == nil {
+			d.Renamed = map[string]string{}
+		}
+		if orig != nk {
+			d.Renamed[nk] = orig
+		}
+	}
 	return store.Change{Action: "edited", Target: label(sg)}, nil
 }
 
@@ -678,6 +696,7 @@ func (s *Server) handleDeleteSegment(w http.ResponseWriter, r *http.Request, u *
 		}
 		doc.Remove(sg)
 		delete(d.Creators, sg.Key())
+		delete(d.Renamed, sg.Key())
 		return store.Change{Action: "deleted", Target: label(sg)}, nil
 	})
 }
@@ -701,13 +720,18 @@ func (s *Server) handleRevertSegment(w http.ResponseWriter, r *http.Request, u *
 		if err != nil {
 			return store.Change{}, err
 		}
-		ls, _ := liveSegment(live, sg.Key())
+		origKey := sg.Key()
+		if o, ok := d.Renamed[origKey]; ok {
+			origKey = o
+		}
+		ls, _ := liveSegment(live, origKey)
 		if ls == nil {
 			doc.Remove(sg)
 			delete(d.Creators, sg.Key())
 		} else {
 			doc.Replace(sg, ls)
 		}
+		delete(d.Renamed, sg.Key())
 		return store.Change{Action: "reverted", Target: label(sg)}, nil
 	})
 }
@@ -787,7 +811,7 @@ func (s *Server) handleDiscard(w http.ResponseWriter, r *http.Request, u *store.
 		}
 		*doc = *nd
 		d.BaseSHA = live.SHA
-		d.Log, d.Creators = nil, map[string]string{}
+		d.Log, d.Creators, d.Renamed = nil, map[string]string{}, nil
 		return store.Change{}, nil
 	})
 }

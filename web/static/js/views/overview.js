@@ -162,21 +162,23 @@ export function serverDialog(existing, onDone) {
         } }, icon('check'), 'It matches — trust this server'))));
     } else {
       result = h('div', { class: 'callout callout-danger' }, icon('alert'), h('div', null, h('strong', null, 'Could not connect'), h('p', null, r.message),
-        h('p', { class: 'muted small' }, 'Did the installer finish without errors? Is the IP/port right? See Help → Troubleshooting.')));
+        h('p', { class: 'muted small' }, 'Did the installer finish without errors? Is the IP/port right? ', h('a', { href: '#/help/troubleshooting', onclick: () => m.close() }, 'Troubleshooting help'), '.')));
     }
     render();
+    setTimeout(() => body.querySelector('.callout:last-of-type')?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }), 50);
   };
   const remove = async () => {
     if (!await confirmDialog('Remove ' + s.name + '?', 'CaddyWeb will stop managing this server. Caddy keeps running with its current Caddyfile. To also remove the agent, run the installer with --uninstall on that server.', { confirm: 'Remove', danger: true })) return;
     try {
       await api('DELETE', `/api/servers/${encodeURIComponent(s.id)}`);
       toast('Server removed', 'ok');
+      saved = true;
       m.close();
-      onDone && onDone();
     } catch (e) { toast(e.message, 'error'); }
   };
 
   render();
   const m = modal({ title: existing ? 'Server connection — ' + existing.name : 'Add a Caddy server', body, wide: true,
-    actions: [{ label: 'Done', kind: 'primary', onClick: () => { onDone && onDone(); } }] });
+    onClose: () => { if (saved && onDone) onDone(); },
+    actions: [{ label: 'Done', kind: 'primary' }] });
 }

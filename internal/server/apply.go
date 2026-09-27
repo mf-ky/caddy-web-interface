@@ -158,7 +158,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, u *store.Us
 	}
 	newLive := store.Live{Text: d.Text, SHA: shaOf(d.Text), Fetched: time.Now()}
 	_ = sc.st.SetLive(newLive)
-	d.BaseSHA, d.Log, d.Creators = newLive.SHA, nil, map[string]string{}
+	d.BaseSHA, d.Log, d.Creators, d.Renamed = newLive.SHA, nil, map[string]string{}, nil
 	d.Rev++
 	_ = sc.st.SetDraft(d)
 	_ = sc.st.AddHistory(store.ApplyRecord{Time: time.Now(), User: u.Username, Action: "apply", OK: true, Backup: res.Backup, Changes: changes})

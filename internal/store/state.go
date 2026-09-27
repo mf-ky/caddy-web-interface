@@ -51,6 +51,7 @@ type Draft struct {
 	BaseSHA  string            `json:"baseSha"` // SHA of the live file the draft started from
 	Rev      int64             `json:"rev"`
 	Creators map[string]string `json:"creators"` // segment key -> username, for cards added in this draft
+	Renamed  map[string]string `json:"renamed,omitempty"` // new segment key -> key it had on the server
 	Log      []Change          `json:"log"`
 }
 
@@ -333,6 +334,10 @@ func copyDraft(d Draft) Draft {
 		c.Creators[k] = v
 	}
 	c.Log = append([]Change(nil), d.Log...)
+	c.Renamed = map[string]string{}
+	for k, v := range d.Renamed {
+		c.Renamed[k] = v
+	}
 	return c
 }
 

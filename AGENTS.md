@@ -71,12 +71,18 @@ browser ──HTTP──► caddyweb serve (Go, one binary, embeds the UI)
    not-yet-applied site cards, copy site cards, validate; admin = all.
    Secrets are redacted for **every non-admin** (viewer and power).
    The UI hides buttons, but the API is the gatekeeper.
+   Power-user changes are also checked by `checkOwnChanges` (every changed
+   block must be theirs) and `checkPowerUser` (no `import`, no `{$…}`/
+   `{env.…}`/`{file.…}` placeholders, no address that is already live).
 7. **CSRF**: every non-GET `/api/*` request needs header `X-CaddyWeb: 1`
    (and a same-host Origin). Cookies are HttpOnly + SameSite=Strict.
 8. **CSP is strict** (`script-src 'self'`): no inline `<script>`, no `eval`,
    no CDN assets. Everything is served from `web/static`, embedded at build.
 9. **Drafts are optimistic-locked** with `rev`: mutations send `?rev=N`; a
    mismatch returns 409 with fresh `state`. Keep this for every new mutation.
+   A draft is only editable once the live file has been read (`BaseSHA` set);
+   address changes are tracked in `Draft.Renamed` so they show as "changed"
+   and can be undone. Apply/restore hold `draftMu` *and* `fetchMu`.
 10. **Secrets never reach non-admins**: use `caddyfile.RedactSegment/RedactText`
     in any new endpoint that returns Caddyfile content.
 
@@ -134,6 +140,9 @@ dark twice: `@media (prefers-color-scheme: dark)` for "system" and
 
 ## UI conventions & gotchas
 
+* The agent checks configs with `caddy adapt` (parse only) — never
+  `caddy validate`, which starts modules and can open files as the agent
+  user. Full validation happens in Caddy's reload, which rolls back on error.
 * Build DOM with `h(tag, props, ...children)`; replace children with
   `fill(el, ...)` — **not** `el.replaceChildren(...)`, which renders `null` as
   the text "null".

@@ -71,13 +71,20 @@ function otherOptions(node, known, ctx, title = 'Other options') {
 
 function reverseProxyEditor(node, ctx) {
   const wrap = h('div', { class: 'stack' });
+  // the list keeps empty rows the user just added (they aren't tokens yet)
+  const initial = splitMatcher(node).rest;
+  const ups = initial.length ? initial : [''];
+  const toCount = findAll(node.block, 'to').reduce((n, t) => n + args(t).length, 0);
   const render = () => {
-    const { matcher, rest } = splitMatcher(node);
-    const ups = rest.length ? rest : [''];
     const setUps = (list) => setMatcherAndArgs(node, splitMatcher(node).matcher, list);
     const transport = findAll(node.block, 'transport').find((t) => args(t)[0] === 'http');
     const skip = !!(transport && find(transport.block, 'tls_insecure_skip_verify'));
-    const pctx = { firstUpstream: ups[0] ? (ups[0].includes('://') ? ups[0] : 'http://' + ups[0]) : '', firstAddress: ctx.firstAddress };
+    const plainHTTP = ups.filter(Boolean).length > 0 && ups.filter(Boolean).every((u) => u.startsWith('http://'));
+    const addr = (ctx.getAddress ? ctx.getAddress() : ctx.firstAddress) || 'example.com';
+    const pctx = {
+      firstUpstream: ups[0] ? (ups[0].includes('://') ? ups[0] : 'http://' + ups[0]) : '',
+      firstAddress: addr.startsWith('http://') ? addr : 'https://' + addr.replace(/^https:\/\//, ''),
+    };
 
     const known = (c) => ['header_up', 'header_down', 'lb_policy', 'health_uri', 'flush_interval'].includes(name(c)) ||
       (name(c) === 'transport' && args(c)[0] === 'http' && (c.block || []).every((x) => ['tls_insecure_skip_verify', 'tls'].includes(name(x))));
@@ -90,9 +97,9 @@ function reverseProxyEditor(node, ctx) {
           const a = args(c);
           const set = (dirName, field, ...vals) => { c.tokens = [dirName, quote(field), ...vals.filter((v) => v !== '').map(quote)]; };
           return h('div', { class: 'header-row' },
-            select([['header_up', 'To backend'], ['header_down', 'To visitor']], c.tokens[0], (v) => set(v, a[0] || '', ...a.slice(1))),
-            input(a[0] || '', (v) => { a[0] = v; set(c.tokens[0], v, ...a.slice(1)); }, { placeholder: 'Header-Name (prefix - to remove)', class: 'mono' }),
-            input(a.slice(1).join(' '), (v) => { set(c.tokens[0], a[0] || '', ...(v.trim() ? [v] : [])); }, { placeholder: 'value', class: 'mono' }),
+            select([['header_up', 'To backend'], ['header_down', 'To visitor']], c.tokens[0], (v) => { const cur = args(c); set(v, cur[0] || '', ...cur.slice(1)); }),
+            input(a[0] || '', (v) => { const cur = args(c); set(c.tokens[0], v, ...cur.slice(1)); }, { placeholder: 'Header-Name (prefix - to remove)', class: 'mono' }),
+            input(a.slice(1).join(' '), (v) => { const cur = args(c); set(c.tokens[0], cur[0] || '', ...(v.trim() ? [v] : [])); }, { placeholder: 'value', class: 'mono' }),
             h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Remove', onclick: () => { node.block.splice(node.block.indexOf(c), 1); renderHeaders(); } }, icon('x')));
         }),
         h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => { kids(node).push(dir('header_up', 'X-Custom-Header', 'value')); renderHeaders(); } }, icon('plus'), 'Add header rule'));
@@ -100,10 +107,10 @@ function reverseProxyEditor(node, ctx) {
     renderHeaders();
 
     fill(wrap, 
-      field(ups.length > 1 ? 'Backends (load balanced)' : 'Send traffic to',
+      field(ups.length + toCount > 1 ? 'Backends (load balanced)' : 'Send traffic to',
         listEditor(ups, (list, structural) => { setUps(list); if (structural) render(); }, { placeholder: '192.168.0.10:8080  or  https://192.168.0.10:8443', addLabel: 'Add another backend (load balancing)', min: 1 }),
         'IP or host name with port. Start with https:// if the app itself uses HTTPS.'),
-      toggle('Backend uses a self-signed certificate', skip, (on) => {
+      plainHTTP && !skip ? null : toggle('Backend uses a self-signed certificate', skip, (on) => {
         let t = findAll(node.block, 'transport').find((x) => args(x)[0] === 'http');
         if (on) {
           if (!t) { t = blockDir('transport', ['http'], []); kids(node).push(t); }
@@ -113,7 +120,7 @@ function reverseProxyEditor(node, ctx) {
           if (!(t.block || []).length) node.block.splice(node.block.indexOf(t), 1);
         }
       }, 'Typical for Proxmox, NAS panels, routers, UniFi… Caddy will still encrypt the connection but won’t check the backend’s certificate.'),
-      ups.length > 1 ? h('div', { class: 'grid-2' },
+      ups.length + toCount > 1 ? h('div', { class: 'grid-2' },
         field('How to share the load', select(LB_POLICIES, args(find(node.block, 'lb_policy') || dir('x', 'random'))[0], (v) => {
           removeWhere(kids(node), (c) => name(c) === 'lb_policy');
           if (v !== 'random') node.block.unshift(dir('lb_policy', v));
@@ -154,9 +161,9 @@ function reverseProxyEditor(node, ctx) {
 }
 
 function rootEditor(node) {
-  const { rest } = splitMatcher(node);
+  const { matcher, rest } = splitMatcher(node);
   return h('div', { class: 'stack' },
-    field('Folder on the Caddy server', input(rest[0] || '', (v) => { node.tokens = ['root', '*', quote(v)]; }, { placeholder: '/srv/www', class: 'mono' }),
+    field('Folder on the Caddy server', input(rest[0] || '', (v) => { node.tokens = ['root', matcher || '*', quote(v)]; }, { placeholder: '/srv/www', class: 'mono' }),
       'The files must be readable by the “caddy” user on the Caddy server.'));
 }
 
@@ -194,6 +201,9 @@ function redirEditor(node) {
 
 function respondEditor(node) {
   const { matcher, rest } = splitMatcher(node);
+  if (node.tokens.some((t) => t.startsWith('<<'))) {
+    return h('div', { class: 'callout' }, icon('info'), h('span', null, 'This response uses a multi-line text block. Use “Text” (top right of this box) to edit it.'));
+  }
   let body = rest.find((x) => !/^\d{3}$/.test(x)) ?? '';
   let code = rest.find((x) => /^\d{3}$/.test(x)) ?? '';
   const setT = () => setMatcherAndArgs(node, splitMatcher(node).matcher, body === '' && code ? [code] : [body, code]);
@@ -205,51 +215,60 @@ function respondEditor(node) {
 }
 
 function encodeEditor(node) {
-  const a = args(node);
+  const { matcher, rest } = splitMatcher(node);
+  const formats = new Set(rest.length ? rest : ['zstd', 'gzip']); // bare "encode" means both
   const set = (fmt, on) => {
-    const cur = new Set(node.tokens.slice(1));
-    if (on) cur.add(fmt); else cur.delete(fmt);
-    node.tokens = ['encode', ...['zstd', 'gzip'].filter((f) => cur.has(f)), ...[...cur].filter((f) => !['zstd', 'gzip'].includes(f))];
+    if (on) formats.add(fmt); else formats.delete(fmt);
+    const ordered = [...['zstd', 'gzip'].filter((f) => formats.has(f)), ...[...formats].filter((f) => !['zstd', 'gzip'].includes(f))];
+    node.tokens = ['encode', ...(matcher ? [matcher] : []), ...(ordered.length ? ordered : ['gzip'])];
   };
   return h('div', { class: 'stack' },
     h('p', { class: 'muted' }, 'Compress responses so pages load faster. Safe to leave on.'),
     h('div', { class: 'row-wrap' },
-      toggle('Zstandard (modern, fastest)', a.includes('zstd') || a.length === 0, (on) => set('zstd', on)),
-      toggle('Gzip (works everywhere)', a.includes('gzip') || a.length === 0, (on) => set('gzip', on))));
+      toggle('Zstandard (modern, fastest)', formats.has('zstd'), (on) => set('zstd', on)),
+      toggle('Gzip (works everywhere)', formats.has('gzip'), (on) => set('gzip', on))));
 }
 
 function headerEditor(node, ctx) {
   const wrap = h('div', { class: 'stack' });
-  const render = () => {
-    // normalise to block form so rows are easy to edit
+  // One-line "header Name value" stays one line until the user changes it.
+  const toBlock = () => {
+    if (node.block) return;
     const { matcher, rest } = splitMatcher(node);
-    if (!node.block && rest.length) {
-      node.block = [{ type: 'directive', tokens: rest.map(quote), block: null }];
-      node.tokens = ['header', ...(matcher ? [matcher] : [])];
-    }
-    if (!node.block) node.block = [];
-    const rows = node.block.filter((c) => c.type === 'directive' && c.__raw === undefined);
-    const presetOn = (p) => rows.some((c) => unquote(c.tokens[0]).toLowerCase() === p.field.toLowerCase() && (p.value === '' || args({ tokens: ['x', ...c.tokens.slice(1)] }).join(' ') === p.value));
-    fill(wrap, 
+    node.block = rest.length ? [{ type: 'directive', tokens: node.tokens.slice(node.tokens.length - rest.length), block: null }] : [];
+    node.tokens = ['header', ...(matcher ? [matcher] : [])];
+  };
+  const rowsOf = () => {
+    if (node.block) return node.block.filter((c) => c.type === 'directive' && c.__raw === undefined);
+    const { rest } = splitMatcher(node);
+    return rest.length ? [{ type: 'directive', tokens: node.tokens.slice(node.tokens.length - rest.length), block: null, inline: true }] : [];
+  };
+  const render = () => {
+    const rows = rowsOf();
+    const presetOn = (p) => rows.some((c) => unquote(c.tokens[0]).toLowerCase() === p.field.toLowerCase() && (p.value === '' || c.tokens.slice(1).map(unquote).join(' ') === p.value));
+    fill(wrap,
       h('p', { class: 'muted' }, 'Headers added to every response sent to visitors.'),
       h('div', { class: 'presets' }, RESPONSE_HEADER_PRESETS.map((p) => h('label', { class: 'preset' },
         h('input', { type: 'checkbox', checked: presetOn(p), onchange: (e) => {
+          toBlock();
           removeWhere(node.block, (c) => c.type === 'directive' && unquote(c.tokens[0] || '').toLowerCase() === p.field.toLowerCase());
           if (e.target.checked) node.block.push({ type: 'directive', tokens: [quote(p.field), ...(p.value ? [quote(p.value)] : [])], block: null });
           render();
         } }),
         h('span', null, h('strong', null, p.label), h('small', null, p.desc))))),
       h('div', { class: 'sub-label' }, 'All header rules'),
-      ...rows.map((c) => {
-        const f = unquote(c.tokens[0] || '');
-        const v = c.tokens.slice(1).map(unquote).join(' ');
+      ...rows.map((row, idx) => {
+        const f = unquote(row.tokens[0] || '');
+        const v = row.tokens.slice(1).map(unquote).join(' ');
+        // editing a row: make sure we're editing the real node in block form
+        const real = () => { toBlock(); return node.block.filter((c) => c.type === 'directive' && c.__raw === undefined)[idx]; };
         return h('div', { class: 'header-row header-row-2' },
-          input(f, (nv) => { c.tokens = [quote(nv), ...c.tokens.slice(1)]; }, { placeholder: 'Header-Name (-Name removes it)', class: 'mono' }),
-          input(v, (nv) => { c.tokens = [c.tokens[0], ...(nv ? [quote(nv)] : [])]; }, { placeholder: 'value', class: 'mono' }),
-          h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Remove', onclick: () => { node.block.splice(node.block.indexOf(c), 1); render(); } }, icon('x')));
+          input(f, (nv) => { const c = real(); c.tokens = [quote(nv), ...c.tokens.slice(1)]; }, { placeholder: 'Header-Name (-Name removes it)', class: 'mono' }),
+          input(v, (nv) => { const c = real(); c.tokens = [c.tokens[0], ...(nv ? [quote(nv)] : [])]; }, { placeholder: 'value', class: 'mono' }),
+          h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Remove', onclick: () => { const c = real(); node.block.splice(node.block.indexOf(c), 1); render(); } }, icon('x')));
       }),
-      h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => { node.block.push({ type: 'directive', tokens: ['X-Custom', 'value'], block: null }); render(); } }, icon('plus'), 'Add header'),
-      matcherField(node, () => []));
+      h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => { toBlock(); node.block.push({ type: 'directive', tokens: ['X-Custom', 'value'], block: null }); render(); } }, icon('plus'), 'Add header'),
+      node.block ? matcherField(node, () => []) : null);
   };
   render();
   return wrap;
@@ -267,7 +286,7 @@ function basicAuthEditor(node, ctx) {
         h('button', { class: 'btn btn-sm', type: 'button', onclick: () => setPassword(c) }, icon('key'), c.tokens[1] ? 'Change password' : 'Set password'),
         h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Remove', onclick: () => { node.block.splice(node.block.indexOf(c), 1); render(); } }, icon('x')))),
       h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => { const c = { type: 'directive', tokens: ['user'], block: null }; node.block.push(c); render(); setPassword(c); } }, icon('plus'), 'Add login'),
-      matcherField(node, () => []));
+      matcherField(node, () => splitMatcher(node).rest));
   };
   const setPassword = (c) => {
     const pw = h('input', { type: 'password', autocomplete: 'new-password' });
@@ -342,8 +361,13 @@ function logEditor(node) {
     h('p', { class: 'muted' }, 'Record every visit (time, address, path, status). By default logs go to Caddy’s journal: journalctl -u caddy.'),
     field('Write to a file instead', input(file, (v) => {
       if (!node.block) node.block = [];
-      removeWhere(node.block, (c) => name(c) === 'output');
-      if (v.trim()) node.block.push(dir('output', 'file', v.trim()));
+      const o = find(node.block, 'output');
+      if (o && args(o)[0] === 'file') {
+        if (v.trim()) o.tokens = ['output', 'file', quote(v.trim())]; else node.block.splice(node.block.indexOf(o), 1);
+      } else if (v.trim()) {
+        removeWhere(node.block, (c) => name(c) === 'output');
+        node.block.push(dir('output', 'file', v.trim()));
+      }
       if (!node.block.length) node.block = null;
     }, { placeholder: '/var/log/caddy/access.log', class: 'mono' }), 'Folder must be writable by the caddy user.', { optional: true }));
 }
@@ -354,7 +378,7 @@ function forwardAuthEditor(node, ctx) {
   const copy = find(node.block, 'copy_headers');
   return h('div', { class: 'stack' },
     h('p', { class: 'muted' }, 'Ask a login service (Authelia, Authentik, …) whether the visitor may enter before showing the site.'),
-    field('Auth service', input(rest[0] || '', (v) => setMatcherAndArgs(node, splitMatcher(node).matcher, [v]), { placeholder: 'authelia:9091', class: 'mono' })),
+    field('Auth service', input(rest[0] || '', (v) => setMatcherAndArgs(node, splitMatcher(node).matcher, [v, ...splitMatcher(node).rest.slice(1)]), { placeholder: 'authelia:9091', class: 'mono' })),
     field('Verify path', input(uri ? args(uri)[0] : '', (v) => { if (!node.block) node.block = []; removeWhere(node.block, (c) => name(c) === 'uri'); if (v) node.block.unshift(dir('uri', v)); }, { placeholder: '/api/authz/forward-auth', class: 'mono' })),
     field('Copy these headers to the app', input(copy ? args(copy).join(' ') : '', (v) => { if (!node.block) node.block = []; removeWhere(node.block, (c) => name(c) === 'copy_headers'); const l = v.split(/\s+/).filter(Boolean); if (l.length) node.block.push(dir('copy_headers', ...l)); }, { placeholder: 'Remote-User Remote-Groups Remote-Email', class: 'mono' }), null, { optional: true }));
 }
@@ -365,10 +389,14 @@ function uriEditor(node) {
   let op = a[0] && !isMatcher(node.tokens[1]) ? a[0] : (a[1] || 'strip_prefix');
   const matcher = isMatcher(node.tokens[1]) ? node.tokens[1] : '';
   let rest = a.slice(matcher ? 2 : 1);
-  const setT = () => { node.tokens = ['uri', ...(matcher ? [matcher] : []), op, ...rest.filter(Boolean).map(quote)]; };
+  const setT = () => {
+    const vals = [...rest];
+    while (vals.length && vals[vals.length - 1] === '' && !(op === 'replace' && vals.length === 2)) vals.pop();
+    node.tokens = ['uri', ...(matcher ? [matcher] : []), op, ...vals.map(quote)];
+  };
   return h('div', { class: 'stack' },
     field('Change the path by', select(ops, op, (v) => { op = v; setT(); })),
-    field('Values', input(rest.join(' '), (v) => { rest = v.split(/\s+/); setT(); }, { placeholder: '/api', class: 'mono' }), 'For replace: the text to find, then its replacement.'));
+    field('Values', input(rest.map((x) => (x === '' || /\s/.test(x) ? quote(x) : x)).join(' '), (v) => { rest = (v.match(/"[^"]*"|\S+/g) || []).map(unquote); setT(); }, { placeholder: '/api', class: 'mono' }), 'For replace: the text to find, then its replacement. Use "" for an empty replacement.'));
 }
 
 // Registry. `desc` shows in the "Add behavior" menu and on the item header.
@@ -378,7 +406,7 @@ export const DIRECTIVES = {
   file_server: { label: 'Serve files', icon: 'folder', group: 'Serve', desc: 'Serve static files from the site folder.', make: () => dir('file_server'), editor: fileServerEditor },
   php_fastcgi: { label: 'PHP', icon: 'php', group: 'Serve', desc: 'Run .php files through PHP-FPM.', make: () => dir('php_fastcgi', 'unix//run/php/php-fpm.sock'), editor: simpleArgsEditor('PHP-FPM address', 'unix//run/php/php-fpm.sock  or  127.0.0.1:9000', 'Where PHP-FPM listens.') },
   respond: { label: 'Fixed response', icon: 'message', group: 'Serve', desc: 'Reply with fixed text and a status code.', make: () => dir('respond', 'OK', '200'), editor: respondEditor },
-  redir: { label: 'Redirect', icon: 'redirect', group: 'Routing', desc: 'Send visitors to another address.', make: () => dir('redir', '/', 'permanent'), editor: redirEditor },
+  redir: { label: 'Redirect', icon: 'redirect', group: 'Routing', desc: 'Send visitors to another address.', make: () => dir('redir', 'https://example.com{uri}', 'permanent'), editor: redirEditor },
   handle_path: { label: 'Path route (strip prefix)', icon: 'branch', group: 'Routing', desc: 'Handle one path separately, removing the prefix before passing it on.', make: () => blockDir('handle_path', ['/api/*'], [dir('reverse_proxy', '192.168.0.10:3000')]), editor: blockDirectiveEditor('Path', 'The prefix (e.g. /api) is removed before the request is passed on.') },
   handle: { label: 'Path route', icon: 'branch', group: 'Routing', desc: 'Handle matching requests separately (only the first matching route runs).', make: () => blockDir('handle', ['/app/*'], [dir('reverse_proxy', '192.168.0.10:8080')]), editor: blockDirectiveEditor('Path or matcher', 'Leave empty for “everything else”.') },
   route: { label: 'Ordered group', icon: 'layers', group: 'Routing', desc: 'Run the directives inside exactly in the order written.', make: () => blockDir('route', [], []), editor: blockDirectiveEditor('Path or matcher', null) },
@@ -389,10 +417,14 @@ export const DIRECTIVES = {
   basicauth: { label: 'Password protection', icon: 'lock', group: 'Security', hidden: true, editor: basicAuthEditor },
   forward_auth: { label: 'Single sign-on (forward auth)', icon: 'shield', group: 'Security', desc: 'Let Authelia/Authentik decide who gets in.', make: () => { const n = dir('forward_auth', 'authelia:9091'); n.block = [dir('uri', '/api/authz/forward-auth'), dir('copy_headers', 'Remote-User', 'Remote-Groups', 'Remote-Email', 'Remote-Name')]; return n; }, editor: forwardAuthEditor },
   header: { label: 'Response headers', icon: 'shield', group: 'Security', desc: 'Security headers, caching, CORS…', make: () => { const n = dir('header'); n.block = [{ type: 'directive', tokens: ['X-Content-Type-Options', 'nosniff'], block: null }, { type: 'directive', tokens: ['Referrer-Policy', 'strict-origin-when-cross-origin'], block: null }, { type: 'directive', tokens: ['-Server'], block: null }]; return n; }, editor: headerEditor },
-  request_body: { label: 'Upload size limit', icon: 'archive', group: 'Security', desc: 'Refuse uploads larger than a limit.', make: () => { const n = dir('request_body'); n.block = [dir('max_size', '100MB')]; return n; }, editor: (node) => h('div', { class: 'stack' }, field('Maximum size', input(args(find(node.block, 'max_size') || dir('x'))[0] || '', (v) => { node.block = v ? [dir('max_size', v)] : []; }, { placeholder: '100MB', class: 'mono' }), 'e.g. 10MB, 1GB')) },
+  request_body: { label: 'Upload size limit', icon: 'archive', group: 'Security', desc: 'Refuse uploads larger than a limit.', make: () => { const n = dir('request_body'); n.block = [dir('max_size', '100MB')]; return n; }, editor: (node) => h('div', { class: 'stack' }, field('Maximum size', input(args(find(node.block, 'max_size') || dir('x'))[0] || '', (v) => {
+    if (!node.block) node.block = [];
+    removeWhere(node.block, (c) => name(c) === 'max_size');
+    if (v.trim()) node.block.unshift(dir('max_size', v.trim()));
+  }, { placeholder: '100MB', class: 'mono' }), 'e.g. 10MB, 1GB')) },
   encode: { label: 'Compression', icon: 'zap', group: 'Performance', desc: 'Make pages smaller and faster to load.', make: () => dir('encode', 'zstd', 'gzip'), editor: encodeEditor },
   log: { label: 'Access log', icon: 'history', group: 'Other', desc: 'Record every request.', make: () => dir('log'), editor: logEditor },
-  import: { label: 'Use a snippet', icon: 'snippet', group: 'Other', desc: 'Include a reusable snippet.', make: () => dir('import', 'common'), editor: importEditor },
+  import: { label: 'Use a snippet', icon: 'snippet', group: 'Other', desc: 'Include a reusable snippet.', make: (ctx) => dir('import', (ctx && ctx.snippets && ctx.snippets[0]) || 'common'), editor: importEditor },
   abort: { label: 'Drop connection', icon: 'x', group: 'Other', desc: 'Close the connection without answering.', make: () => dir('abort', '/wp-admin*'), editor: simpleArgsEditor('For these paths', '/wp-admin*', 'Leave empty to drop every request.') },
   templates: { label: 'Templates', icon: 'code', group: 'Other', desc: 'Process files as Go templates.', make: () => dir('templates'), editor: () => h('p', { class: 'muted' }, 'Files are rendered as templates before being sent. No settings needed.') },
   metrics: { label: 'Metrics endpoint', icon: 'zap', group: 'Other', desc: 'Expose Prometheus metrics at this address.', make: () => dir('metrics', '/metrics'), editor: simpleArgsEditor('Path', '/metrics', null) },

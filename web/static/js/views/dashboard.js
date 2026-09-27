@@ -23,7 +23,7 @@ export async function renderDashboard(view, id, stillCurrent) {
   if (!stillCurrent()) return;
   let state = first;
   let dns = { installed: [], checked: false };
-  const header = serverHeader(summary, 'sites');
+  let header = serverHeader(summary, 'sites');
   const banners = h('div', { class: 'banners' });
   const toolbar = h('div', { class: 'toolbar' });
   const content = h('div', { class: 'dash' });
@@ -62,6 +62,12 @@ export async function renderDashboard(view, id, stillCurrent) {
 
   // ---- rendering ----
   function renderAll() {
+    // keep the status pill in the header in step with the draft
+    summary.pending = changes().length;
+    summary.conflict = state.conflict;
+    const fresh = serverHeader(summary, 'sites');
+    header.replaceWith(fresh);
+    header = fresh;
     renderBanners();
     renderToolbar();
     renderCards();
@@ -107,7 +113,7 @@ export async function renderDashboard(view, id, stillCurrent) {
       h('div', { class: 'chips' }, chips),
       h('span', { class: 'spacer' }),
       h('button', { class: 'icon-btn', type: 'button', title: 'Reload from server', 'aria-label': 'Reload from server', onclick: () => refresh(true) }, icon('refresh')),
-      app.canAdd && !state.parseError ? h('button', { class: 'btn btn-primary', type: 'button', onclick: newCard }, icon('plus'), 'New') : null);
+      app.canAdd && !state.parseError && (summary.ok || state.segments.length) ? h('button', { class: 'btn btn-primary', type: 'button', onclick: newCard }, icon('plus'), 'New') : null);
   }
 
   function matches(seg) {
@@ -148,7 +154,7 @@ export async function renderDashboard(view, id, stillCurrent) {
     const prov = readProvider(acme);
     const email = find(g.nodes, 'email');
     const adminN = find(g.nodes, 'admin');
-    const adminVal = adminN ? args(adminN)[0] : 'localhost:2019';
+    const adminVal = (adminN && args(adminN)[0]) || 'localhost:2019';
     const exposed = adminVal.startsWith('0.0.0.0') || adminVal.startsWith(':');
     const card = h('article', { class: 'global-card status-' + g.status, tabindex: '0', role: 'button', 'aria-label': 'Global settings',
       onclick: () => open(g), onkeydown: (e) => { if (e.key === 'Enter') open(g); } },
@@ -224,9 +230,14 @@ export async function renderDashboard(view, id, stillCurrent) {
   }
 
   function linkFor(a) {
-    if (a.startsWith('http://') || a.startsWith('https://')) return a.includes('*') ? null : a;
-    if (a.startsWith(':') || a.includes('*') || a.includes('{')) return null;
-    return 'https://' + a;
+    if (a.includes('*') || a.includes('{')) return null;
+    if (a.startsWith('http://') || a.startsWith('https://')) return a;
+    if (a.startsWith(':')) return null;
+    // follow a custom https_port from the global options
+    const g = state.segments.find((s) => s.kind === 'global');
+    const hp = g && find(g.nodes, 'https_port');
+    const port = hp ? args(hp)[0] : '';
+    return 'https://' + a + (port && port !== '443' && !/:\d+$/.test(a) ? ':' + port : '');
   }
 
   // ---- pending changes ----

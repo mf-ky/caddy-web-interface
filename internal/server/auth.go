@@ -210,7 +210,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	u := s.users.Get(strings.TrimSpace(req.Username))
+	u := s.users.Verify(strings.TrimSpace(req.Username), req.Password) // also records the sign-in
 	s.setSession(w, r, u)
 	writeJSON(w, s.sessionView(u))
 }

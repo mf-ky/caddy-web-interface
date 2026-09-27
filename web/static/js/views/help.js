@@ -100,7 +100,7 @@ function sections() {
       P(B('Server identity.'), ' CaddyWeb remembers each server’s SSH fingerprint and refuses to connect if it changes.'),
       P(B('Serve CaddyWeb over HTTPS'), ' if you use it from untrusted networks: ', C('caddyweb serve --tls-cert … --tls-key …'), ' or put it behind Caddy (on its own port, so a broken Caddyfile can’t lock you out of the tool that fixes it).'),
     ] },
-    { id: 'trouble', title: 'Troubleshooting', icon: 'help', body: [
+    { id: 'troubleshooting', title: 'Troubleshooting', icon: 'help', body: [
       UL([B('“refused CaddyWeb’s key”'), ' — the agent installer wasn’t run on that server, or was run with a different CaddyWeb. Run it again. On OpenSSH servers with ', C('AllowUsers'), ', add ', C('caddyweb'), '.'],
         [B('“cannot reach … connection refused”'), ' — wrong IP/port, SSH not running, or a firewall.'],
         [B('“server’s SSH key changed”'), ' — the server was reinstalled, or something is impersonating it. If you reinstalled it, remove and re-add the server.'],

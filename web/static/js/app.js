@@ -116,7 +116,7 @@ function renderShell(root) {
     h('header', { class: 'topbar' },
       h('div', { class: 'topbar-inner' },
         h('a', { href: '#/', class: 'brand-link', 'aria-label': 'CaddyWeb home' }, brand()),
-        h('nav', { class: 'nav', 'aria-label': 'Main' }, nav.map(([href, label, ic]) => h('a', { href, class: 'nav-link', 'data-nav': href }, icon(ic), h('span', null, label)))),
+        h('nav', { class: 'nav', 'aria-label': 'Main' }, nav.map(([href, label, ic]) => h('a', { href, class: 'nav-link', 'data-nav': href, title: label, 'aria-label': label }, icon(ic), h('span', null, label)))),
         h('div', { class: 'topbar-actions' },
           h('button', { class: 'icon-btn', id: 'theme-btn', type: 'button', title: 'Theme: system / light / dark', 'aria-label': 'Change theme', onclick: cycleTheme }),
           userMenu))),
@@ -166,7 +166,9 @@ async function route() {
   } catch (e) {
     if (!stillCurrent()) return;
     fill(view, h('div', { class: 'empty-state' }, icon('alert', 'xl'), h('h2', null, 'Something went wrong'), h('p', null, e.message),
-      h('button', { class: 'btn', type: 'button', onclick: route }, icon('refresh'), 'Try again')));
+      h('div', { class: 'row-wrap' },
+        h('button', { class: 'btn', type: 'button', onclick: route }, icon('refresh'), 'Try again'),
+        h('a', { class: 'btn btn-ghost', href: '#/' }, icon('server'), 'Back to servers'))));
   }
   if (stillCurrent()) window.scrollTo({ top: 0 });
 }

@@ -149,8 +149,11 @@ func (s *Server) summarize(ctx context.Context, cfg store.ServerConfig) serverSu
 		}
 	}
 	sum.Conflict = live.SHA != "" && shaOf(d.Text) != live.SHA && d.BaseSHA != live.SHA
-	if h := sc.st.History(); len(h) > 0 {
-		sum.LastApply = &h[0]
+	for _, h := range sc.st.History() {
+		if h.OK {
+			sum.LastApply = &h
+			break
+		}
 	}
 	return sum
 }
