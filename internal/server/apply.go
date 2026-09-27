@@ -21,24 +21,46 @@ import (
 )
 
 // caddyErrorResponse sends a Caddy/agent failure to the UI, pointing at the
-// card that contains the offending line when possible.
-func caddyErrorResponse(w http.ResponseWriter, ce *remote.CaddyError, text string) {
+// card that contains the offending line when possible. For non-admins every
+// secret value is scrubbed, and context lines are only shown from blocks
+// without secrets.
+func caddyErrorResponse(w http.ResponseWriter, ce *remote.CaddyError, text string, u *store.User) {
+	admin := u == nil || u.Role == store.RoleAdmin
+	var secrets []string
+	if !admin && text != "" {
+		secrets = caddyfile.SecretValues(text)
+		c := *ce
+		c.Message, c.Detail = caddyfile.Scrub(c.Message, secrets), caddyfile.Scrub(c.Detail, secrets)
+		ce = &c
+	}
 	data := map[string]any{"caddy": ce}
 	if ce.Line > 0 && text != "" {
 		lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
 		from, to := max(ce.Line-4, 1), min(ce.Line+3, len(lines))
-		var ctx []map[string]any
-		for i := from; i <= to; i++ {
-			ctx = append(ctx, map[string]any{"n": i, "text": lines[i-1]})
-		}
-		data["context"] = ctx
 		if doc, err := caddyfile.Parse(text); err == nil {
 			for sg, rng := range doc.Lines() {
 				if ce.Line >= rng[0] && ce.Line <= rng[1] {
 					data["segmentKey"] = sg.Key()
 					data["segmentLabel"] = label(sg)
+					if !admin {
+						// only show lines of this block, and only if it holds no secrets
+						if caddyfile.RedactSegment(sg).Format("\t") != sg.Format("\t") {
+							from, to = 1, 0
+						} else {
+							from, to = max(from, rng[0]), min(to, rng[1])
+						}
+					}
 				}
 			}
+		} else if !admin {
+			from, to = 1, 0
+		}
+		var ctx []map[string]any
+		for i := from; i <= to && i <= len(lines); i++ {
+			ctx = append(ctx, map[string]any{"n": i, "text": lines[i-1]})
+		}
+		if len(ctx) > 0 {
+			data["context"] = ctx
 		}
 	}
 	code := http.StatusUnprocessableEntity
@@ -47,6 +69,8 @@ func caddyErrorResponse(w http.ResponseWriter, ce *remote.CaddyError, text strin
 		code = http.StatusConflict
 	case "connection", "hostkey", "notconfigured":
 		code = http.StatusBadGateway
+	case "notfound":
+		code = http.StatusNotFound
 	}
 	msg := ce.Message
 	switch ce.Kind {
@@ -58,16 +82,23 @@ func caddyErrorResponse(w http.ResponseWriter, ce *remote.CaddyError, text strin
 	writeErrData(w, code, msg, data)
 }
 
+// agentCtx is used for calls that change the server: they must finish even
+// if the browser goes away, or the agent could be stopped half-way.
+func agentCtx(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(r.Context()), 3*time.Minute)
+}
+
 func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
+	live, _ := sc.syncLive(r.Context(), false)
 	sc.draftMu.Lock()
-	text := sc.st.Draft().Text
+	text := sc.currentDraft(live).Text
 	sc.draftMu.Unlock()
 	if strings.TrimSpace(text) == "" {
 		writeErr(w, http.StatusBadRequest, "Nothing to validate.")
 		return
 	}
 	if err := sc.client.Validate(r.Context(), text); err != nil {
-		caddyErrorResponse(w, remote.Explain(err), text)
+		caddyErrorResponse(w, remote.Explain(err), text, u)
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true, "message": "Caddy says the configuration is valid."})
@@ -83,12 +114,20 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, u *store.Us
 	}
 	live, liveErr := sc.syncLive(r.Context(), true)
 	if liveErr != nil {
-		caddyErrorResponse(w, liveErr, "")
+		caddyErrorResponse(w, liveErr, "", u)
 		return
 	}
 	sc.draftMu.Lock()
 	defer sc.draftMu.Unlock()
+	// No re-reads of the live file while the agent is swapping it: a read
+	// half-way could mistake a failed attempt for the new live version.
+	sc.fetchMu.Lock()
+	defer sc.fetchMu.Unlock()
 	d := sc.currentDraft(live)
+	if d.BaseSHA == "" {
+		writeErr(w, http.StatusConflict, "This draft has no known starting point on the server; refresh and try again.")
+		return
+	}
 	if in.Rev != d.Rev {
 		writeErrData(w, http.StatusConflict, "The draft changed since you reviewed it. Please review again.", map[string]any{"state": sc.buildState(r.Context(), u, live, nil, d)})
 		return
@@ -101,17 +140,22 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, u *store.Us
 	if in.Force {
 		expected = live.SHA
 	}
-	res, err := sc.client.Apply(r.Context(), d.Text, expected)
+	actx, cancel := agentCtx(r)
+	defer cancel()
+	res, err := sc.client.Apply(actx, d.Text, expected)
 	if err != nil {
 		ce := remote.Explain(err)
 		if ce.Kind == "conflict" {
 			ce.Message = "Someone changed the Caddyfile on the server after you started editing. Review the server's changes, then either discard your draft or keep it and apply again."
 		}
 		_ = sc.st.AddHistory(store.ApplyRecord{Time: time.Now(), User: u.Username, Action: "apply", OK: false, Error: ce.Message, Changes: d.Log})
-		caddyErrorResponse(w, ce, d.Text)
+		caddyErrorResponse(w, ce, d.Text, u)
 		return
 	}
 	changes := d.Log
+	if in.Force {
+		changes = append(changes, store.Change{Time: time.Now(), User: u.Username, Action: "overwrote changes made directly on the server", Target: "Caddyfile"})
+	}
 	newLive := store.Live{Text: d.Text, SHA: shaOf(d.Text), Fetched: time.Now()}
 	_ = sc.st.SetLive(newLive)
 	d.BaseSHA, d.Log, d.Creators = newLive.SHA, nil, map[string]string{}
@@ -172,7 +216,7 @@ func (sc *serverCtx) pruneMirror(keep int) {
 			names = append(names, e.Name())
 		}
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(names)))
+	sort.Slice(names, func(i, j int) bool { return remote.NewerBackup(names[i], names[j]) })
 	for i, n := range names {
 		if i >= keep {
 			_ = os.Remove(filepath.Join(sc.mirrorDir(), n))
@@ -267,7 +311,7 @@ func (s *Server) handleOffsiteRun(w http.ResponseWriter, r *http.Request, u *sto
 func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
 	list, err := sc.client.Backups(r.Context())
 	if err != nil {
-		caddyErrorResponse(w, remote.Explain(err), "")
+		caddyErrorResponse(w, remote.Explain(err), "", u)
 		return
 	}
 	who := map[string]store.ApplyRecord{}
@@ -298,17 +342,22 @@ func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request, u *store.
 		dir = info.BackupDir
 	}
 	set := s.state.Settings()
-	writeJSON(w, map[string]any{
-		"backups": items, "retention": set.BackupRetention, "dir": dir,
-		"mirrorDir": sc.mirrorDir(), "offsite": set.Offsite,
-	})
+	out := map[string]any{"backups": items, "retention": set.BackupRetention, "dir": dir}
+	if u.Role == store.RoleAdmin {
+		out["mirrorDir"], out["offsite"] = sc.mirrorDir(), set.Offsite
+	}
+	writeJSON(w, out)
 }
 
 func (s *Server) handleBackupRead(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
 	name := r.PathValue("name")
+	if !remote.ValidBackupName(name) {
+		writeErr(w, http.StatusBadRequest, "That is not a valid backup name.")
+		return
+	}
 	text, err := sc.client.BackupRead(r.Context(), name)
 	if err != nil {
-		caddyErrorResponse(w, remote.Explain(err), "")
+		caddyErrorResponse(w, remote.Explain(err), "", u)
 		return
 	}
 	live, _ := sc.syncLive(r.Context(), false)
@@ -323,6 +372,10 @@ func (s *Server) handleBackupRead(w http.ResponseWriter, r *http.Request, u *sto
 
 func (s *Server) handleBackupDownload(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
 	name := r.PathValue("name")
+	if !remote.ValidBackupName(name) {
+		writeErr(w, http.StatusBadRequest, "That is not a valid backup name.")
+		return
+	}
 	text, err := sc.client.BackupRead(r.Context(), name)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, remote.Explain(err).Message)
@@ -335,6 +388,10 @@ func (s *Server) handleBackupDownload(w http.ResponseWriter, r *http.Request, u 
 
 func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
 	name := r.PathValue("name")
+	if !remote.ValidBackupName(name) {
+		writeErr(w, http.StatusBadRequest, "That is not a valid backup name.")
+		return
+	}
 	var in struct {
 		DiscardDraft bool `json:"discardDraft"`
 	}
@@ -343,11 +400,13 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, u *store.
 	}
 	live, liveErr := sc.syncLive(r.Context(), true)
 	if liveErr != nil {
-		caddyErrorResponse(w, liveErr, "")
+		caddyErrorResponse(w, liveErr, "", u)
 		return
 	}
 	sc.draftMu.Lock()
 	defer sc.draftMu.Unlock()
+	sc.fetchMu.Lock()
+	defer sc.fetchMu.Unlock()
 	d := sc.currentDraft(live)
 	if shaOf(d.Text) != live.SHA && !in.DiscardDraft {
 		writeErrData(w, http.StatusConflict, "You have unapplied changes. Restoring a backup will discard them.", map[string]any{"needsDiscard": true})
@@ -355,14 +414,16 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, u *store.
 	}
 	text, err := sc.client.BackupRead(r.Context(), name)
 	if err != nil {
-		caddyErrorResponse(w, remote.Explain(err), "")
+		caddyErrorResponse(w, remote.Explain(err), "", u)
 		return
 	}
-	res, err := sc.client.Restore(r.Context(), name, live.SHA)
+	actx, cancel := agentCtx(r)
+	defer cancel()
+	res, err := sc.client.Restore(actx, name, live.SHA)
 	if err != nil {
 		ce := remote.Explain(err)
 		_ = sc.st.AddHistory(store.ApplyRecord{Time: time.Now(), User: u.Username, Action: "restore", OK: false, Error: ce.Message, Note: name})
-		caddyErrorResponse(w, ce, text)
+		caddyErrorResponse(w, ce, text, u)
 		return
 	}
 	newLive := store.Live{Text: text, SHA: shaOf(text), Fetched: time.Now()}
@@ -375,7 +436,17 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, u *store.
 }
 
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
-	writeJSON(w, map[string]any{"history": sc.st.History()})
+	h := sc.st.History()
+	if h == nil {
+		h = []store.ApplyRecord{}
+	}
+	if u.Role != store.RoleAdmin {
+		secrets := append(caddyfile.SecretValues(sc.st.Live().Text), caddyfile.SecretValues(sc.st.Draft().Text)...)
+		for i := range h {
+			h[i].Error = caddyfile.Scrub(h[i].Error, secrets)
+		}
+	}
+	writeJSON(w, map[string]any{"history": h})
 }
 
 func (s *Server) handleDNSProviders(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {

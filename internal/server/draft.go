@@ -79,9 +79,11 @@ func (sc *serverCtx) currentDraft(live store.Live) store.Draft {
 	}
 	changed := false
 	switch {
-	case d.Text == "" && d.BaseSHA == "":
-		// first run: start from the live file
+	case d.BaseSHA == "":
+		// first run (or a draft that never had a real starting point): start
+		// from the live file
 		d.Text, d.BaseSHA, changed = live.Text, live.SHA, true
+		d.Log, d.Creators = nil, map[string]string{}
 	case shaOf(d.Text) == live.SHA && (d.BaseSHA != live.SHA || len(d.Log) > 0 || len(d.Creators) > 0):
 		// draft matches the server (applied, or edited to the same result)
 		d.BaseSHA, changed = live.SHA, true
@@ -313,8 +315,21 @@ func forbidden(msg string) error { return &httpError{code: http.StatusForbidden,
 
 // mutate runs fn against a parsed copy of the draft and saves the result.
 func (s *Server) mutate(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx, fn func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error)) {
+	s.mutateOpts(w, r, u, sc, false, fn)
+}
+
+// mutateOpts runs fn against a parsed copy of the draft and saves the result.
+// replacesAll marks mutations that replace the whole file (raw edit, discard);
+// those still work when the current draft can't be parsed.
+func (s *Server) mutateOpts(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx, replacesAll bool, fn func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error)) {
 	rev, _ := strconv.ParseInt(r.URL.Query().Get("rev"), 10, 64)
 	live, liveErr := sc.syncLive(r.Context(), false)
+	if live.SHA == "" {
+		// Without the real file we'd build a draft from nothing, and applying
+		// it would replace the whole Caddyfile.
+		writeErr(w, http.StatusConflict, "CaddyWeb hasn't been able to read this server's Caddyfile yet, so it can't be edited. Check the connection and try again.")
+		return
+	}
 
 	sc.draftMu.Lock()
 	defer sc.draftMu.Unlock()
@@ -325,9 +340,13 @@ func (s *Server) mutate(w http.ResponseWriter, r *http.Request, u *store.User, s
 	}
 	doc, err := caddyfile.Parse(d.Text)
 	if err != nil {
-		writeErr(w, http.StatusConflict, "The draft Caddyfile can't be read ("+err.Error()+"). An admin can fix it on the Caddyfile page.")
-		return
+		if !replacesAll {
+			writeErr(w, http.StatusConflict, "The draft Caddyfile can't be read ("+err.Error()+"). An admin can fix it on the Caddyfile page (Edit as text) or discard the draft.")
+			return
+		}
+		doc = &caddyfile.Document{Indent: "\t"}
 	}
+	before := segmentTexts(doc)
 	change, err := fn(doc, &d, live)
 	if err != nil {
 		var he *httpError
@@ -338,7 +357,21 @@ func (s *Server) mutate(w http.ResponseWriter, r *http.Request, u *store.User, s
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	d.Text = doc.String()
+	text := doc.String()
+	// The result must read back cleanly, and a non-admin may only have
+	// touched cards they own.
+	after, perr := caddyfile.Parse(text)
+	if perr != nil {
+		writeErr(w, http.StatusBadRequest, "That change would make the Caddyfile unreadable: "+perr.Error())
+		return
+	}
+	if u.Role != store.RoleAdmin {
+		if err := checkOwnChanges(before, segmentTexts(after), d.Creators, u.Username); err != nil {
+			writeErr(w, http.StatusForbidden, err.Error())
+			return
+		}
+	}
+	d.Text = text
 	d.Rev++
 	change.Time, change.User = time.Now(), u.Username
 	if change.Action != "" {
@@ -355,6 +388,56 @@ func (s *Server) mutate(w http.ResponseWriter, r *http.Request, u *store.User, s
 		return
 	}
 	writeJSON(w, sc.buildState(r.Context(), u, live, liveErr, d))
+}
+
+// segmentTexts maps each segment key to its text (keys repeated in a file get
+// a numeric suffix so nothing is hidden).
+func segmentTexts(doc *caddyfile.Document) map[string]string {
+	out := map[string]string{}
+	for _, sg := range doc.Segments() {
+		k := sg.Key()
+		for i := 2; ; i++ {
+			if _, dup := out[k]; !dup {
+				break
+			}
+			k = fmt.Sprintf("%s#%d", sg.Key(), i)
+		}
+		out[k] = sg.Text(doc.Indent)
+	}
+	if len(doc.Parts) > 0 {
+		var filler strings.Builder
+		for _, p := range doc.Parts {
+			if p.Seg == nil {
+				filler.WriteString(strings.TrimSpace(p.Filler))
+			}
+		}
+		out["\x00filler"] = filler.String()
+	}
+	return out
+}
+
+// checkOwnChanges allows a non-admin change only if every block that was
+// added, changed or removed is one the user created in this draft.
+func checkOwnChanges(before, after map[string]string, creators map[string]string, user string) error {
+	keys := map[string]bool{}
+	for k := range before {
+		keys[k] = true
+	}
+	for k := range after {
+		keys[k] = true
+	}
+	for k := range keys {
+		if before[k] == after[k] {
+			continue
+		}
+		if k == "\x00filler" {
+			return fmt.Errorf("Power users can only change their own cards.")
+		}
+		if creators[k] != user {
+			return fmt.Errorf("Power users can only add cards or change cards they added themselves (not %s).", strings.TrimPrefix(strings.TrimPrefix(k, "site:"), "snippet:"))
+		}
+	}
+	return nil
 }
 
 func findSegment(doc *caddyfile.Document, r *http.Request) (*caddyfile.Segment, error) {
@@ -427,6 +510,9 @@ func (s *Server) handleAddSegment(w http.ResponseWriter, r *http.Request, u *sto
 		if err := caddyfile.CheckSegment(sg); err != nil {
 			return store.Change{}, badRequest("%v", err)
 		}
+		if err := checkPowerUser(u, sg, live); err != nil {
+			return store.Change{}, err
+		}
 		if err := checkDuplicates(doc, sg, nil); err != nil {
 			return store.Change{}, err
 		}
@@ -462,7 +548,56 @@ func canEdit(u *store.User, sg *caddyfile.Segment, d *store.Draft, live store.Li
 	return nil
 }
 
-func (s *Server) replaceSegment(doc *caddyfile.Document, d *store.Draft, u *store.User, old, sg *caddyfile.Segment) (store.Change, error) {
+// checkPowerUser limits what a non-admin's card may contain: nothing that
+// reads files or environment variables on the Caddy server (their contents
+// could come back in error messages), and no address that is already live
+// (that would silently take over an existing site).
+func checkPowerUser(u *store.User, sg *caddyfile.Segment, live store.Live) error {
+	if u.Role == store.RoleAdmin {
+		return nil
+	}
+	var bad string
+	caddyfile.Walk(sg.Nodes, func(n *caddyfile.Node, _ []*caddyfile.Node) {
+		if n.Type != "directive" || bad != "" {
+			return
+		}
+		if n.Tokens[0] == "import" {
+			bad = "import"
+		}
+		for _, t := range n.Tokens {
+			if strings.Contains(t, "{$") || strings.Contains(t, "{env.") || strings.Contains(t, "{file.") {
+				bad = t
+			}
+		}
+	})
+	for _, h := range sg.Header {
+		if strings.Contains(h, "{$") || strings.Contains(h, "{env.") {
+			bad = h
+		}
+	}
+	if bad != "" {
+		return forbidden("Power users can't use imports or environment/file placeholders (" + bad + "). Ask an admin.")
+	}
+	if ldoc, err := caddyfile.Parse(live.Text); err == nil {
+		mine := map[string]bool{}
+		for _, a := range sg.Addresses() {
+			mine[strings.ToLower(a)] = true
+		}
+		for _, ls := range ldoc.Segments() {
+			if ls.Kind != sg.Kind {
+				continue
+			}
+			for _, a := range ls.Addresses() {
+				if mine[strings.ToLower(a)] {
+					return forbidden(a + " is already a live site. Only an admin can change it.")
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Server) replaceSegment(doc *caddyfile.Document, d *store.Draft, u *store.User, old, sg *caddyfile.Segment, live store.Live) (store.Change, error) {
 	if sg.Kind != old.Kind && u.Role != store.RoleAdmin {
 		return store.Change{}, forbidden("You can't change the type of this block.")
 	}
@@ -471,6 +606,9 @@ func (s *Server) replaceSegment(doc *caddyfile.Document, d *store.Draft, u *stor
 	}
 	if sg.Kind == caddyfile.KindGlobal && old.Kind != caddyfile.KindGlobal {
 		return store.Change{}, badRequest("Global options must be the first block; edit the existing one instead.")
+	}
+	if err := checkPowerUser(u, sg, live); err != nil {
+		return store.Change{}, err
 	}
 	if err := checkDuplicates(doc, sg, old); err != nil {
 		return store.Change{}, err
@@ -504,7 +642,7 @@ func (s *Server) handleUpdateSegment(w http.ResponseWriter, r *http.Request, u *
 		if err := caddyfile.CheckSegment(sg); err != nil {
 			return store.Change{}, badRequest("%v", err)
 		}
-		return s.replaceSegment(doc, d, u, old, sg)
+		return s.replaceSegment(doc, d, u, old, sg, live)
 	})
 }
 
@@ -528,7 +666,7 @@ func (s *Server) handleUpdateSegmentRaw(w http.ResponseWriter, r *http.Request, 
 		if old.Kind == caddyfile.KindGlobal && sg.Kind != caddyfile.KindGlobal {
 			return store.Change{}, badRequest("The global options block must start with '{' on its own.")
 		}
-		return s.replaceSegment(doc, d, u, old, sg)
+		return s.replaceSegment(doc, d, u, old, sg, live)
 	})
 }
 
@@ -619,7 +757,7 @@ func (s *Server) handleDraftRaw(w http.ResponseWriter, r *http.Request, u *store
 	if !readJSON(w, r, &in) {
 		return
 	}
-	s.mutate(w, r, u, sc, func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error) {
+	s.mutateOpts(w, r, u, sc, true, func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error) {
 		if strings.TrimSpace(in.Text) == "" {
 			return store.Change{}, badRequest("The Caddyfile can't be empty.")
 		}
@@ -639,7 +777,7 @@ func (s *Server) handleDraftRaw(w http.ResponseWriter, r *http.Request, u *store
 }
 
 func (s *Server) handleDiscard(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
-	s.mutate(w, r, u, sc, func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error) {
+	s.mutateOpts(w, r, u, sc, true, func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error) {
 		if live.SHA == "" {
 			return store.Change{}, badRequest("Can't discard without a connection to the Caddy server.")
 		}

@@ -180,3 +180,83 @@ func TestResolveRawRejectsInjection(t *testing.T) {
 		t.Fatalf("raw parse: %v %+v", err, nodes)
 	}
 }
+
+func TestHeredocWithTrailingTokens(t *testing.T) {
+	src := "a.com {\n\trespond <<TXT\n\t\tline   with   spaces\n\t\t  indented\n\t\tTXT 200\n}\n"
+	doc, err := Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := doc.Segments()[0].Nodes
+	if len(n) != 1 || len(n[0].Tokens) != 3 || n[0].Tokens[2] != "200" {
+		t.Fatalf("heredoc not one directive: %+v", n)
+	}
+	doc.Segments()[0].MarkDirty()
+	again, err := Parse(doc.String())
+	if err != nil || again.Segments()[0].Nodes[0].Tokens[1] != n[0].Tokens[1] {
+		t.Fatalf("heredoc changed after reformat:\n%s", doc.String())
+	}
+}
+
+func TestReviewRegressions(t *testing.T) {
+	// a quote in the middle of a word is an ordinary character (as in Caddy)
+	bad := []*Node{{Type: "directive", Tokens: []string{"respond", "a\"\n}\nevil.localhost {\n\trespond pwned\n}\nb {\n\trespond x\""}}}
+	if _, err := ResolveRaw(bad); err == nil {
+		t.Fatal("mid-word quote injection accepted")
+	}
+	if _, err := Parse("a.com {\n\theader X-Foo foo\\\"bar\n}\n"); err != nil {
+		t.Fatalf("mid-word quote rejected: %v", err)
+	}
+	for _, c := range []string{"# hi\n}\nevil.localhost {", "#x\r\ny"} {
+		if _, err := ResolveRaw([]*Node{{Type: "comment", Text: c}}); err == nil {
+			t.Fatalf("comment injection accepted: %q", c)
+		}
+		seg := &Segment{Kind: KindSite, Header: []string{"a.com"}, HeaderComment: c}
+		if CheckSegment(seg) == nil {
+			t.Fatalf("header comment injection accepted: %q", c)
+		}
+	}
+	if CheckSegment(&Segment{Kind: KindSite, Header: []string{"(snip)"}}) == nil {
+		t.Fatal("snippet disguised as site accepted")
+	}
+	for _, tok := range []string{"x\\", "<<EOF", "a\u00a0}"} {
+		if checkToken(tok) == nil {
+			t.Fatalf("token %q accepted", tok)
+		}
+	}
+	// comment after trailing comma, and after a closing brace
+	src := "a.localhost, # primary\n  b.localhost {\n\trespond hi\n} # end\n\nc.localhost {\n\trespond c\n}\n"
+	doc, err := Parse(src)
+	if err != nil || len(doc.Segments()) != 2 || doc.String() != src {
+		t.Fatalf("parse: %v %d", err, len(doc.Segments()))
+	}
+	doc.Segments()[0].MarkDirty()
+	out := doc.String()
+	if !strings.Contains(out, "} # end") || !strings.Contains(out, "# primary") {
+		t.Fatalf("comments lost:\n%s", out)
+	}
+	if again, err := Parse(out); err != nil || len(again.Segments()) != 2 {
+		t.Fatalf("reformatted file broken: %v\n%s", err, out)
+	}
+	// two blocks on one line
+	if doc, err := Parse("a.localhost {\n}  b.localhost {\n\trespond x\n}\n"); err != nil || len(doc.Segments()) != 2 {
+		t.Fatalf("same-line blocks: %v", err)
+	}
+	// mixed line endings: untouched parts stay byte-identical
+	mixed := "a.localhost {\n\trespond hi\n}\r\nb.localhost {\r\n\trespond b\r\n}\r\n"
+	md, _ := Parse(mixed)
+	if md.String() != mixed {
+		t.Fatalf("mixed endings changed: %q", md.String())
+	}
+	// appending to a brace-less site adds braces first
+	bl, _ := Parse("localhost\n\nrespond hi\n")
+	bl.Append(&Segment{Kind: KindSite, Header: []string{"new.localhost"}, Nodes: []*Node{{Type: "directive", Tokens: []string{"respond", "x"}}}})
+	if again, err := Parse(bl.String()); err != nil || len(again.Segments()) != 2 {
+		t.Fatalf("append to brace-less: %v\n%s", err, bl.String())
+	}
+	// quoted directive names are still redacted
+	red := RedactText("a.com {\n\t\"basic_auth\" {\n\t\tbob $2a$14$secrethash\n\t}\n\theader_up X-Api-Token SECRETTOKEN\n}\n")
+	if strings.Contains(red, "secrethash") || strings.Contains(red, "SECRETTOKEN") {
+		t.Fatalf("secret leaked:\n%s", red)
+	}
+}

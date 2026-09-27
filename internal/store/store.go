@@ -41,6 +41,10 @@ func writeJSON(path string, v any, perm os.FileMode) error {
 		tmp.Close()
 		return err
 	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
 	if err := tmp.Chmod(perm); err != nil {
 		tmp.Close()
 		return err

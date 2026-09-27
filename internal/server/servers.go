@@ -391,6 +391,16 @@ func (s *Server) handleCopySegment(w http.ResponseWriter, r *http.Request, u *st
 
 	// Add it to the target server's draft.
 	tlive, _ := target.syncLive(r.Context(), false)
+	if tlive.SHA == "" {
+		writeErr(w, http.StatusConflict, "CaddyWeb hasn't been able to read the other server's Caddyfile yet, so nothing can be added to it.")
+		return
+	}
+	if err := checkPowerUser(u, cp, tlive); err != nil {
+		var he *httpError
+		errors.As(err, &he)
+		writeErr(w, he.code, he.msg)
+		return
+	}
 	target.draftMu.Lock()
 	defer target.draftMu.Unlock()
 	td := target.currentDraft(tlive)

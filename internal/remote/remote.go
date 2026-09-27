@@ -92,7 +92,7 @@ type Client struct {
 
 // NewClient creates a client; signer may be nil in local mode.
 func NewClient(cfg Config, signer ssh.Signer) *Client {
-	return &Client{cfg: cfg, signer: signer, timeout: 60 * time.Second}
+	return &Client{cfg: cfg, signer: signer, timeout: 150 * time.Second}
 }
 
 // SetConfig swaps the connection settings (closing any open connection).
@@ -114,6 +114,9 @@ func (c *Client) Config() Config {
 }
 
 var safeArg = regexp.MustCompile(`^[A-Za-z0-9._:-]+$`)
+
+// Commands that are safe to repeat if the connection dropped mid-way.
+var idempotent = map[string]bool{"version": true, "info": true, "read": true, "validate": true, "backups": true, "backup-read": true, "modules": true}
 
 // Run executes an agent command with optional stdin.
 func (c *Client) Run(ctx context.Context, stdin []byte, args ...string) ([]byte, error) {
@@ -137,7 +140,7 @@ func (c *Client) Run(ctx context.Context, stdin []byte, args ...string) ([]byte,
 	out, err := c.runSSH(ctx, stdin, args)
 	var ae *AgentError
 	var hk *HostKeyError
-	if err != nil && hadConn && !errors.As(err, &ae) && !errors.As(err, &hk) {
+	if err != nil && hadConn && idempotent[args[0]] && !errors.As(err, &ae) && !errors.As(err, &hk) {
 		// the kept-open connection may have gone stale; retry once on a fresh one
 		c.dropConn()
 		out, err = c.runSSH(ctx, stdin, args)

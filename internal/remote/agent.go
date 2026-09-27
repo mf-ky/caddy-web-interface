@@ -125,8 +125,28 @@ func (c *Client) Backups(ctx context.Context) ([]Backup, error) {
 		ts, _ := strconv.ParseInt(f[2], 10, 64)
 		list = append(list, Backup{Name: f[0], Size: size, Time: time.Unix(ts, 0)})
 	}
-	sort.Slice(list, func(i, j int) bool { return list[i].Name > list[j].Name })
+	sort.Slice(list, func(i, j int) bool { return NewerBackup(list[i].Name, list[j].Name) })
 	return list, nil
+}
+
+// NewerBackup orders backup names newest first: by timestamp, then by the
+// numeric suffix used when several backups share a second (.2 < .10).
+func NewerBackup(a, b string) bool {
+	ab, as := splitSuffix(a)
+	bb, bs := splitSuffix(b)
+	if ab != bb {
+		return ab > bb
+	}
+	return as > bs
+}
+
+func splitSuffix(name string) (string, int) {
+	base := strings.TrimPrefix(name, "Caddyfile.")
+	if i := strings.IndexByte(base, '.'); i >= 0 {
+		n, _ := strconv.Atoi(base[i+1:])
+		return base[:i], n
+	}
+	return base, 0
 }
 
 // BackupRead returns a backup's content.
@@ -172,8 +192,10 @@ type CaddyError struct {
 	Detail  string `json:"detail,omitempty"`
 }
 
-var lineRe = regexp.MustCompile(`Caddyfile:(\d+)`)
-var pathRe = regexp.MustCompile(`/[^\s:'"]*/run\.\d+/Caddyfile`)
+// Line numbers are only taken from references to the staged file itself, so
+// text inside an error (e.g. a file name) can't point somewhere else.
+var lineRe = regexp.MustCompile(`(?:caddyweb-staged|/run\.\d+/Caddyfile):(\d+)`)
+var pathRe = regexp.MustCompile(`/[^\s:'"]*(?:/run\.\d+/Caddyfile|Caddyfile\.caddyweb-staged)`)
 
 // Explain converts an error from Run into a CaddyError.
 func Explain(err error) *CaddyError {
@@ -197,10 +219,12 @@ func Explain(err error) *CaddyError {
 		ce.Kind = "reload"
 	case ExitConflict:
 		ce.Kind = "conflict"
+	case ExitNoBackup:
+		ce.Kind = "notfound"
 	default:
 		ce.Kind = "error"
 	}
-	if m := lineRe.FindStringSubmatch(detail); m != nil {
+	if m := lineRe.FindStringSubmatch(ae.Stderr); m != nil {
 		ce.Line, _ = strconv.Atoi(m[1])
 	}
 	return ce

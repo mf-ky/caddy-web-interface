@@ -36,6 +36,8 @@ type Segment struct {
 	Comments      []string    `json:"comments"`      // leading comment lines, raw ("# Pi-hole")
 	Header        []string    `json:"header"`        // addresses / "(name)" / directive tokens
 	HeaderComment string      `json:"headerComment"` // "# ..." after the opening brace
+	// TrailingComment is a "# ..." after the closing brace (kept, not editable)
+	TrailingComment string `json:"-"`
 	Nodes         []*Node     `json:"nodes"`
 	Braces        bool        `json:"-"` // false only for a brace-less single site file
 
@@ -109,13 +111,40 @@ func (d *Document) String() string {
 			b.WriteString(p.Filler)
 			continue
 		}
-		b.WriteString(p.Seg.Text(d.Indent))
+		b.WriteString(p.Seg.textNL(d.Indent, d.CRLF))
 	}
-	out := b.String()
-	if d.CRLF {
+	return b.String()
+}
+
+// textNL is Text with generated (re-formatted) text using the file's line
+// endings; original bytes are never touched.
+func (s *Segment) textNL(indent string, crlf bool) string {
+	if !s.dirty && s.raw != "" {
+		return s.raw
+	}
+	out := s.Format(indent)
+	if crlf {
 		out = strings.ReplaceAll(strings.ReplaceAll(out, "\r\n", "\n"), "\n", "\r\n")
 	}
 	return out
+}
+
+func (d *Document) nl() string {
+	if d.CRLF {
+		return "\r\n"
+	}
+	return "\n"
+}
+
+// braceAll makes sure a brace-less single-site file gets braces before a
+// second block is added (otherwise the new block would be read as part of it).
+func (d *Document) braceAll() {
+	for _, sg := range d.Segments() {
+		if !sg.Braces {
+			sg.Braces = true
+			sg.MarkDirty()
+		}
+	}
 }
 
 // Text renders one segment: its original bytes if unchanged, otherwise a
@@ -156,12 +185,34 @@ func (s *Segment) Format(indent string) string {
 	}
 	b.WriteString("\n")
 	writeNodes(&b, s.Nodes, indent, 1)
-	b.WriteString("}\n")
+	b.WriteString("}")
+	if s.TrailingComment != "" {
+		b.WriteString(" " + s.TrailingComment)
+	}
+	b.WriteString("\n")
 	return b.String()
 }
 
 func joinHeader(h []string) string {
-	return strings.Join(h, " ")
+	return joinTokens(h)
+}
+
+// joinTokens writes tokens on one line. A plain word that would change
+// meaning when it ends a line is protected: "<<X" (heredoc start) is quoted,
+// and a trailing backslash (line continuation) gets a space after it.
+func joinTokens(toks []string) string {
+	out := make([]string, len(toks))
+	for i, t := range toks {
+		if !strings.ContainsAny(t, "\n\"`") && strings.HasPrefix(t, "<<") {
+			t = `"` + t + `"`
+		}
+		out[i] = t
+	}
+	line := strings.Join(out, " ")
+	if strings.HasSuffix(line, "\\") {
+		line += " " // "\ " keeps the backslash from joining the next line
+	}
+	return line
 }
 
 // FormatNodes renders a list of nodes at the given depth.
@@ -181,7 +232,7 @@ func writeNodes(b *strings.Builder, nodes []*Node, indent string, depth int) {
 			b.WriteString(pad + n.Text + "\n")
 			continue
 		}
-		b.WriteString(pad + strings.Join(n.Tokens, " "))
+		b.WriteString(pad + joinTokens(n.Tokens))
 		if n.Block != nil {
 			b.WriteString(" {")
 		}
@@ -232,15 +283,16 @@ func collapseBlank(s string) string {
 
 // Append adds a segment at the end of the file, separated by one blank line.
 func (d *Document) Append(seg *Segment) {
-	text := d.String()
+	d.braceAll()
+	text := strings.ReplaceAll(d.String(), "\r\n", "\n")
 	sep := ""
 	switch {
 	case text == "":
 	case strings.HasSuffix(text, "\n\n"):
 	case strings.HasSuffix(text, "\n"):
-		sep = "\n"
+		sep = d.nl()
 	default:
-		sep = "\n\n"
+		sep = d.nl() + d.nl()
 	}
 	if sep != "" {
 		d.Parts = append(d.Parts, &Part{Filler: sep})
@@ -263,7 +315,8 @@ func (d *Document) InsertAfter(after *Segment, seg *Segment) {
 		d.Append(seg)
 		return
 	}
-	rest := append([]*Part{{Filler: "\n"}, {Seg: seg}}, d.Parts[idx+1:]...)
+	d.braceAll()
+	rest := append([]*Part{{Filler: d.nl()}, {Seg: seg}}, d.Parts[idx+1:]...)
 	d.Parts = append(d.Parts[:idx+1], rest...)
 }
 
@@ -283,9 +336,10 @@ func (d *Document) Replace(old, new *Segment) bool {
 // Prepend puts seg at the very top of the file (used for a new global
 // options block, which Caddy requires to come first).
 func (d *Document) Prepend(seg *Segment) {
+	d.braceAll()
 	parts := []*Part{{Seg: seg}}
 	if len(d.Parts) > 0 {
-		parts = append(parts, &Part{Filler: "\n"})
+		parts = append(parts, &Part{Filler: d.nl()})
 	}
 	d.Parts = append(parts, d.Parts...)
 }
@@ -297,7 +351,7 @@ func (d *Document) Lines() map[*Segment][2]int {
 	for _, p := range d.Parts {
 		var text string
 		if p.Seg != nil {
-			text = p.Seg.Text(d.Indent)
+			text = p.Seg.textNL(d.Indent, d.CRLF)
 		} else {
 			text = p.Filler
 		}

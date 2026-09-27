@@ -53,9 +53,9 @@ func usage() {
 	fmt.Fprint(os.Stderr, `CaddyWeb — front end manager for Caddy Server
 
 Usage:
-  caddyweb serve [--listen :8090] [--data DIR]
+  caddyweb serve [--listen :8090] [--data DIR] [--tls-cert FILE --tls-key FILE]
   caddyweb user list
-  caddyweb user add NAME [--role admin|power|viewer] [--password PW]
+  caddyweb user add NAME [--role admin|power|viewer] [--password PW]   (default role: admin)
   caddyweb user passwd NAME [--password PW]     (reset a forgotten password)
   caddyweb user role NAME admin|power|viewer
   caddyweb user delete NAME
@@ -64,7 +64,10 @@ Usage:
   caddyweb version
 
 All commands accept --data DIR (default $CADDYWEB_DATA or /var/lib/caddyweb).
-Roles: admin = full access, power = can add new cards only, viewer = read only.
+serve also reads $CADDYWEB_LISTEN, $CADDYWEB_TLS_CERT and $CADDYWEB_TLS_KEY.
+Roles: admin = full access, power ("Power User") = can add new cards only,
+viewer ("User") = read only.
+
 `)
 }
 

@@ -5,7 +5,7 @@ import { app, navigate, setTheme } from '../app.js';
 
 const ROLES = [
   ['admin', 'Admin', 'Full access: edit, delete, apply, restore backups, manage servers and users.'],
-  ['power', 'Power User', 'Sees everything and can add new cards. Can’t change or delete live cards, apply, or restore.'],
+  ['power', 'Power User', 'Sees all cards and can add new site cards. Can’t change or delete live cards, apply, or restore. Passwords and API keys are hidden.'],
   ['viewer', 'User', 'Read only. Passwords and API keys are hidden.'],
 ];
 

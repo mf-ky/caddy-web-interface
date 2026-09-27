@@ -38,12 +38,12 @@ Caddyfile** — comments and layout included — so you can still open it in
   optionally copied elsewhere with rsync. View, compare, download or restore
   any of them.
 - **Multiple Caddy servers** — overview of all servers, one click into each,
-  **Copy to server…** for cards.
+  **Copy to…** another server for cards.
 - **Certificates** — pick your DNS provider (Porkbun, Cloudflare, Duck DNS,
   Namecheap, Route 53, Hetzner, OVH, … 21 built in); CaddyWeb shows which
   plugins your Caddy has and how to add missing ones.
-- **Users & roles** — Admin, Power User (can add, can’t change/delete/apply),
-  User (read only). Forgotten password? `sudo caddyweb user passwd <name>`.
+- **Users & roles** — Admin, Power User (can add, can’t change/delete/apply;
+  secrets hidden), User (read only). Forgotten password? `sudo caddyweb user passwd <name>`.
 - **Light & dark themes**, works on phones, no internet or CDN needed.
 - **Nothing to lose** — uninstall CaddyWeb and Caddy keeps running with a
   perfectly normal Caddyfile.
@@ -71,7 +71,7 @@ the network (`admin 0.0.0.0:2019`).
 non-programmers). In short:
 
 ```bash
-# 1. on the machine that will run CaddyWeb
+# 1. on the machine that will run CaddyWeb (needs a published release — see INSTALL.md)
 curl -fsSL https://raw.githubusercontent.com/mf-ky/caddy-web-interface/main/scripts/install.sh | sudo bash
 #    or:  git clone … && cd caddy-web-interface && docker compose up -d --build
 
@@ -95,7 +95,7 @@ caddyweb version
 
 ## Development
 
-Go 1.24+, no JavaScript build step (plain ES modules embedded in the binary).
+Go 1.24.7+, no JavaScript build step (plain ES modules embedded in the binary).
 
 ```bash
 make test    # vet + unit tests + end-to-end test against real Caddy (if on PATH)

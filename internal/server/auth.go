@@ -54,7 +54,7 @@ func (s *Server) setSession(w http.ResponseWriter, r *http.Request, u *store.Use
 	val := base64.RawURLEncoding.EncodeToString(payload) + "." + s.sign(payload)
 	http.SetCookie(w, &http.Cookie{
 		Name: cookieName, Value: val, Path: "/", Expires: exp,
-		HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: r.TLS != nil,
+		HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
 	})
 }
 
@@ -96,6 +96,7 @@ type limiter struct {
 type failInfo struct {
 	count int
 	until time.Time
+	last  time.Time
 }
 
 func clientIP(r *http.Request) string {
@@ -121,12 +122,21 @@ func (l *limiter) fail(ip string) {
 	if l.fails == nil {
 		l.fails = map[string]*failInfo{}
 	}
+	if len(l.fails) > 10000 {
+		// forget stale entries so the map can't grow forever
+		for k, f := range l.fails {
+			if time.Since(f.last) > time.Hour {
+				delete(l.fails, k)
+			}
+		}
+	}
 	f := l.fails[ip]
 	if f == nil {
 		f = &failInfo{}
 		l.fails[ip] = f
 	}
 	f.count++
+	f.last = time.Now()
 	if f.count >= 5 {
 		d := time.Duration(1<<min(f.count-5, 4)) * time.Minute // 1,2,4,8,16 min
 		f.until = time.Now().Add(d)
@@ -154,9 +164,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &req) {
 		return
 	}
+	// Count the attempt before checking the password, so many parallel
+	// guesses can't all slip past the limit.
+	s.limiter.fail(ip)
 	u := s.users.Verify(strings.TrimSpace(req.Username), req.Password)
 	if u == nil {
-		s.limiter.fail(ip)
 		writeErr(w, http.StatusUnauthorized, "Wrong username or password.")
 		return
 	}

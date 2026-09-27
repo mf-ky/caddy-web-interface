@@ -17,7 +17,9 @@ func Parse(src string) (*Document, error) {
 		return nil, err
 	}
 	ps := &parser{src: src, toks: toks}
-	doc := &Document{Indent: DetectIndent(src), CRLF: strings.Count(src, "\r\n") > strings.Count(src, "\n")/2}
+	// line endings of new/edited blocks follow the file's first line break
+	nl := strings.IndexByte(src, '\n')
+	doc := &Document{Indent: DetectIndent(src), CRLF: nl > 0 && src[nl-1] == '\r'}
 
 	fillerStart := 0
 	var pending []Token // comment lines directly above the next segment
@@ -54,6 +56,9 @@ func Parse(src string) (*Document, error) {
 		segStart := lineStart(src, t.Start)
 		if len(pending) > 0 {
 			segStart = lineStart(src, pending[0].Start)
+		}
+		if segStart < fillerStart {
+			segStart = fillerStart // previous block ended on this same line
 		}
 		seg, segEnd, err := ps.parseSegment(len(doc.Segments()) == 0)
 		if err != nil {
@@ -111,7 +116,9 @@ func (ps *parser) parseSegment(first bool) (*Segment, int, error) {
 		}
 		seg.Nodes, seg.HeaderComment = nodes, openComment
 		ps.p = next
-		return seg, lineEnd(ps.src, ps.toks[next-1].End), nil
+		end, tc := ps.afterClose(next)
+		seg.TrailingComment = tc
+		return seg, end, nil
 	}
 
 	// Collect header tokens; a trailing comma continues onto the next line.
@@ -123,7 +130,10 @@ func (ps *parser) parseSegment(first bool) (*Segment, int, error) {
 			ps.p++
 			continue
 		}
-		if t.Kind == TokNewline && len(header) > 0 && strings.HasSuffix(header[len(header)-1], ",") {
+		if (t.Kind == TokNewline || t.Kind == TokComment) && len(header) > 0 && strings.HasSuffix(header[len(header)-1], ",") {
+			if t.Kind == TokComment && seg.HeaderComment == "" {
+				seg.HeaderComment = t.Text
+			}
 			ps.p++
 			continue
 		}
@@ -180,9 +190,30 @@ func (ps *parser) parseSegment(first bool) (*Segment, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	seg.Nodes, seg.HeaderComment = nodes, openComment
+	seg.Nodes = nodes
+	if openComment != "" {
+		seg.HeaderComment = openComment
+	}
 	ps.p = next
-	return seg, lineEnd(ps.src, ps.toks[next-1].End), nil
+	end, tc := ps.afterClose(next)
+	seg.TrailingComment = tc
+	return seg, end, nil
+}
+
+// afterClose looks at what follows a top-level block's closing brace (at
+// token index next-1): a comment on the same line belongs to the block;
+// another block starting on the same line ends this one right at the brace.
+func (ps *parser) afterClose(next int) (int, string) {
+	closeTok := ps.toks[next-1]
+	if next < len(ps.toks) && ps.toks[next].Line == closeTok.Line {
+		switch ps.toks[next].Kind {
+		case TokComment:
+			return lineEnd(ps.src, ps.toks[next].End), ps.toks[next].Text
+		case TokWord, TokOpen, TokClose:
+			return closeTok.End, ""
+		}
+	}
+	return lineEnd(ps.src, closeTok.End), ""
 }
 
 func isAloneOnLine(toks []Token, i int) bool {

@@ -2,7 +2,7 @@
 # caddyweb-agent — the ONLY program CaddyWeb is allowed to run on your Caddy server.
 #
 # CaddyWeb connects over SSH with a key that is locked to this script
-# (see ~caddyweb/.ssh/authorized_keys: restrict,command="..."). Whatever
+# (see ~caddyweb/.ssh/authorized_keys: command="...",no-port-forwarding,…). Whatever
 # command CaddyWeb asks for arrives in $SSH_ORIGINAL_COMMAND and must be one
 # of the commands below. There is no shell, no port forwarding, nothing else.
 #
@@ -10,8 +10,10 @@
 #   version                  print the agent protocol version
 #   info                     key=value facts about this server
 #   read                     print the current Caddyfile
-#   validate                 check a Caddyfile from stdin (nothing is changed)
-#   apply <sha256|->         validate stdin, back up the current file, write, reload
+#   validate                 check a Caddyfile from stdin with `caddy adapt` (nothing is changed)
+#   apply <sha256|->         check stdin, back up the current file, write, reload
+#                            (Caddy's reload does the full validation; if it fails the
+#                            previous file is put back)
 #   backups                  list backups: name<TAB>bytes<TAB>unix-time (newest first)
 #   backup-read <name>       print one backup
 #   restore <name> <sha|->   same as apply, using a backup as the new content
@@ -27,7 +29,7 @@
 set -u
 umask 027
 
-AGENT_VERSION=1
+AGENT_VERSION=2
 CADDYFILE=/etc/caddy/Caddyfile
 BACKUP_DIR=/etc/caddy/backups
 STAGING_DIR="${HOME:-/var/lib/caddyweb-agent}/staging"
@@ -37,7 +39,7 @@ MAX_BYTES=1048576
 CONF=/etc/caddyweb-agent.conf
 # A different config file may only be chosen when running locally, never
 # by an SSH client.
-if [ -z "${SSH_ORIGINAL_COMMAND:-}" ] && [ -n "${CADDYWEB_AGENT_CONF:-}" ]; then
+if [ -z "${SSH_ORIGINAL_COMMAND:-}" ] && [ -z "${SSH_CONNECTION:-}" ] && [ -n "${CADDYWEB_AGENT_CONF:-}" ]; then
 	CONF="$CADDYWEB_AGENT_CONF"
 fi
 if [ -r "$CONF" ]; then
@@ -61,9 +63,21 @@ CMD="${ARGS[0]:-}"
 
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 
+# Staged files live next to the real Caddyfile (a file the installer created
+# for us), so relative imports resolve exactly as they will for Caddy. Older
+# installs without it fall back to a private folder.
+stage_path() {
+	if [ -w "$CADDYFILE.caddyweb-staged" ]; then
+		echo "$CADDYFILE.caddyweb-staged"
+	else
+		echo "$WORK/Caddyfile"
+	fi
+}
+
 stage_stdin() {
-	local f="$WORK/Caddyfile"
-	head -c $((MAX_BYTES + 1)) > "$f"
+	local f
+	f="$(stage_path)"
+	head -c $((MAX_BYTES + 1)) > "$f" || die "could not write $f"
 	if [ "$(stat -c %s "$f")" -gt "$MAX_BYTES" ]; then
 		die "Caddyfile is larger than $MAX_BYTES bytes"
 	fi
@@ -74,8 +88,16 @@ stage_stdin() {
 }
 
 validate_file() {
-	# Caddy logs to stderr; keep everything so CaddyWeb can show the error.
-	"$CADDY_BIN" validate --config "$1" --adapter caddyfile 2>&1
+	# Only adapt (parse) the file: nothing in it is started or opened, so a
+	# config can't make this user write files. Caddy's reload validates fully.
+	"$CADDY_BIN" adapt --config "$1" --adapter caddyfile 2>&1 >/dev/null
+}
+
+# Admin address of the currently running config, so a change to the "admin"
+# option can still be delivered to the old endpoint.
+current_admin() {
+	"$CADDY_BIN" adapt --config "$CADDYFILE" --adapter caddyfile 2>/dev/null |
+		grep -o '"admin":{[^}]*' | grep -o '"listen":"[^"]*"' | head -n1 | cut -d'"' -f4
 }
 
 check_expected() {
@@ -87,7 +109,7 @@ check_expected() {
 
 new_backup_name() {
 	local base
-	base="Caddyfile.$(date +%Y-%m-%d_%H-%M-%S)"
+	base="Caddyfile.$(date -u +%Y-%m-%d_%H-%M-%S)"
 	local name="$base" i=1
 	while [ -e "$BACKUP_DIR/$name" ]; do
 		name="$base.$i"
@@ -98,32 +120,47 @@ new_backup_name() {
 
 # install_file <staged-file> <expected-sha>: the heart of apply and restore.
 install_file() {
-	local staged="$1" expected="$2" out name
+	local staged="$1" expected="$2" out name admin
 	if ! out="$(validate_file "$staged")"; then
 		echo "$out" >&2
 		exit 2
 	fi
 	check_expected "$expected"
+	admin="$(current_admin || true)"
 	mkdir -p "$BACKUP_DIR" || die "cannot create $BACKUP_DIR"
 	name=""
 	if [ -f "$CADDYFILE" ]; then
 		name="$(new_backup_name)"
 		cp -p "$CADDYFILE" "$BACKUP_DIR/$name" || die "could not write backup to $BACKUP_DIR"
+		cmp -s "$CADDYFILE" "$BACKUP_DIR/$name" || die "backup copy in $BACKUP_DIR is incomplete (disk full?); nothing was changed"
 	fi
+	# From here on, don't let a dropped connection interrupt us half-way.
+	trap '' HUP INT TERM PIPE
 	# Write in place (not rename) so the file keeps its owner and permissions.
-	cat "$staged" > "$CADDYFILE" || die "could not write $CADDYFILE"
-	if ! out="$("$CADDY_BIN" reload --config "$CADDYFILE" --adapter caddyfile --force 2>&1)"; then
+	if ! cat "$staged" > "$CADDYFILE" || ! cmp -s "$staged" "$CADDYFILE"; then
+		restore_previous "$name" "could not write $CADDYFILE (disk full?)"
+		exit 1
+	fi
+	if ! out="$("$CADDY_BIN" reload --config "$CADDYFILE" --adapter caddyfile --force ${admin:+--address "$admin"} 2>&1)"; then
 		# Caddy keeps running the old config when a reload fails, so put the
 		# old file back to keep disk and running config in agreement.
-		if [ -n "$name" ]; then
-			cat "$BACKUP_DIR/$name" > "$CADDYFILE"
-			rm -f "$BACKUP_DIR/$name"
-		fi
+		restore_previous "$name" ""
 		echo "$out" >&2
 		exit 3
 	fi
 	echo "backup=$name"
 	echo "sha=$(sha "$CADDYFILE")"
+}
+
+# restore_previous <backup-name> <message>: put the backed-up file back.
+restore_previous() {
+	local name="$1" msg="$2"
+	if [ -n "$name" ] && cat "$BACKUP_DIR/$name" > "$CADDYFILE" && cmp -s "$BACKUP_DIR/$name" "$CADDYFILE"; then
+		rm -f "$BACKUP_DIR/$name"
+		[ -n "$msg" ] && echo "$msg — the previous Caddyfile was put back." >&2
+	else
+		echo "${msg:+$msg. }WARNING: could not put the previous Caddyfile back automatically. It is saved as $BACKUP_DIR/$name — restore it with: sudo cp $BACKUP_DIR/$name $CADDYFILE" >&2
+	fi
 }
 
 check_name() {
@@ -139,9 +176,9 @@ rm -rf "$WORK"
 mkdir -p "$WORK" || die "cannot create $WORK"
 trap 'rm -rf "$WORK"' EXIT
 
-# One change at a time.
+# One change at a time (validate too: it shares the staging file).
 case "$CMD" in
-apply | restore | prune)
+validate | apply | restore | prune)
 	if command -v flock >/dev/null 2>&1; then
 		exec 9>"$STAGING_DIR/.lock"
 		flock -w 30 9 || die "another change is still in progress"
@@ -190,7 +227,7 @@ backups)
 		n="$(basename "$f")"
 		[[ "$n" =~ $NAME_RE ]] || continue
 		printf '%s\t%s\t%s\n' "$n" "$(stat -c %s "$f")" "$(stat -c %Y "$f")"
-	done | sort -r
+	done | sort -rV
 	;;
 backup-read)
 	check_name "${ARGS[1]:-}"
@@ -199,18 +236,19 @@ backup-read)
 restore)
 	[ "${#ARGS[@]}" -eq 3 ] || die "usage: restore <name> <sha256|->"
 	check_name "${ARGS[1]}"
-	cp "$BACKUP_DIR/${ARGS[1]}" "$WORK/Caddyfile" || die "could not read backup"
-	install_file "$WORK/Caddyfile" "${ARGS[2]}"
+	f="$(stage_path)"
+	cat "$BACKUP_DIR/${ARGS[1]}" > "$f" || die "could not read backup"
+	install_file "$f" "${ARGS[2]}"
 	;;
 prune)
 	keep="${ARGS[1]:-}"
-	[[ "$keep" =~ ^[0-9]+$ ]] && [ "$keep" -ge 1 ] || die "usage: prune <keep>=1..."
+	[[ "$keep" =~ ^[0-9]{1,5}$ ]] && keep=$((10#$keep)) && [ "$keep" -ge 1 ] || die "usage: prune <keep>=1..."
 	[ -d "$BACKUP_DIR" ] || exit 0
 	for f in "$BACKUP_DIR"/Caddyfile.*; do
 		[ -f "$f" ] || continue
 		n="$(basename "$f")"
 		[[ "$n" =~ $NAME_RE ]] && echo "$n"
-	done | sort -r | tail -n +$((keep + 1)) | while read -r n; do
+	done | sort -rV | tail -n +$((keep + 1)) | while read -r n; do
 		rm -f "$BACKUP_DIR/$n" && echo "deleted=$n"
 	done
 	;;

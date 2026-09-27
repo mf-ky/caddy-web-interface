@@ -67,8 +67,9 @@ browser ──HTTP──► caddyweb serve (Go, one binary, embeds the UI)
    `checkToken` (single token, no newlines/braces). Free text goes through
    `{raw}` nodes and is parsed by `ParseNodes` — never string-concatenated.
 6. **Roles are enforced server-side** (`require`/`onServer` + `canEdit`):
-   viewer = read only (secrets redacted); power = add site cards, edit only
-   their own not-yet-applied cards, copy site cards, validate; admin = all.
+   viewer = read only; power = add site cards, edit only their own
+   not-yet-applied site cards, copy site cards, validate; admin = all.
+   Secrets are redacted for **every non-admin** (viewer and power).
    The UI hides buttons, but the API is the gatekeeper.
 7. **CSRF**: every non-GET `/api/*` request needs header `X-CaddyWeb: 1`
    (and a same-host Origin). Cookies are HttpOnly + SameSite=Strict.
@@ -84,7 +85,7 @@ browser ──HTTP──► caddyweb serve (Go, one binary, embeds the UI)
 ```bash
 make test          # go vet + all tests; the e2e test runs only if `caddy` is on PATH
 make run           # http://localhost:8090, data in ./data
-node --check web/static/js/*.js web/static/js/views/*.js   # JS syntax
+for f in web/static/js/*.js web/static/js/views/*.js; do node --check "$f" || echo "FAIL $f"; done   # JS syntax
 bash -n agent/caddyweb-agent agent/install-agent.sh scripts/install.sh
 ```
 
@@ -104,7 +105,7 @@ watch for console errors.
 `function fooEditor(node, ctx)` that edits `node.tokens` / `node.block` *in
 place* (never rebuild nodes wholesale: comments and unknown sub-options must
 survive), register it in `DIRECTIVES` with `label`, `icon`, `group`, `desc`,
-`make()`. Use `otherOptions()` for sub-options you don't model. If it should
+`make()` and `editor: fooEditor`. Use `otherOptions()` for sub-options you don't model. If it should
 show on cards, extend `summarize()`/`classify()` in `caddy.js`.
 
 **Add a card template (New menu)** — `templates()` in `caddy.js`.

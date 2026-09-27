@@ -39,8 +39,8 @@ function sections() {
       codeBlock(`curl -fsSL ${origin}/agent/install.sh | sudo bash`),
       P('It creates a locked-down ', C('caddyweb'), ' user, installs ', C('/usr/local/bin/caddyweb-agent'), ', lets that user edit ', C('/etc/caddy/Caddyfile'), ', creates ', C('/etc/caddy/backups'), ', and authorizes CaddyWeb’s key. At the end it prints the server’s ', B('fingerprint'), '.'),
       h('h3', null, '5. Test & trust'),
-      P('Back in CaddyWeb press ', B('Test connection'), '. The first time, it shows the server’s fingerprint — check it matches what the installer printed, then press ', B('Trust'), '. Your sites appear as cards.'),
-      TIP(B('Running CaddyWeb on the Caddy server itself?'), ' You can still use SSH to ', C('localhost'), ' (simplest), or choose “This same machine”. For the latter, run the service as the ', C('caddyweb'), ' user the agent installer created, so it has permission to run the agent.'),
+      P('Back in CaddyWeb press ', B('Test connection'), '. The first time, it shows the server’s fingerprint — check it matches one the installer printed, then press ', B('It matches — trust this server'), '. Your sites appear as cards.'),
+      TIP(B('Running CaddyWeb on the Caddy server itself?'), ' Install CaddyWeb first, then add the server with IP ', C('127.0.0.1'), ' and run the agent installer as usual — it reuses the ', C('caddyweb'), ' user. With Docker, use the machine’s LAN IP instead of 127.0.0.1.'),
     ] },
     { id: 'cards', title: 'Cards & what they mean', icon: 'layers', body: [
       P('Each site block becomes a card. The colour and icon show what it does:'),
@@ -58,7 +58,7 @@ function sections() {
       P('Press ', B('New'), ' and pick what you want to create. The form asks only for what matters; everything else Caddy supports can be added with ', B('Add a behavior'), ' — redirects, headers, password protection, compression, path routes, IP restrictions, logs and more.'),
       P('Every behavior can be switched to ', B('Text'), ' to edit it as Caddyfile text, and the ', B('Caddyfile text'), ' tab edits the whole card as text. Anything the forms don’t understand is kept exactly as written.'),
       P(B('Header rules'), ' on a reverse proxy come with ready-made options (with explanations), e.g. “Send the backend its own address as Host” for NAS panels, or “Fix redirects that point to the backend’s internal address”.'),
-      TIP(B('Copy to server…'), ' (in the card editor) copies a card into another server’s draft — handy when two servers should serve the same thing.'),
+      TIP(B('Copy to…'), ' (in the card editor) copies a card into another server’s draft — handy when two servers should serve the same thing.'),
     ] },
     { id: 'apply', title: 'Applying & errors', icon: 'rocket', body: [
       P('Apply always runs ', C('caddy validate'), ' on the server first. If Caddy rejects the file you see its message, the line it points to and which card it is in — and the server is untouched.'),
@@ -86,8 +86,9 @@ function sections() {
     ] },
     { id: 'users', title: 'Accounts & passwords', icon: 'users', body: [
       UL([B('Admin'), ' — everything: edit, delete, apply, restore, servers, users, settings.'],
-        [B('Power User'), ' — sees everything, can add new cards and edit their own new cards until they are applied. Can’t change or delete live cards, apply, or restore.'],
+        [B('Power User'), ' — sees all cards, can add new site cards and edit their own new cards until they are applied. Can’t change or delete live cards, apply, restore or download backups. Passwords and API keys are hidden.'],
         [B('User'), ' — read only. Passwords and API keys are hidden.']),
+      P('On the command line the roles are called ', C('admin'), ', ', C('power'), ' and ', C('viewer'), '.'),
       h('h3', null, 'Forgot a password?'),
       P('There is no “forgot password” link on purpose. On the machine running CaddyWeb:'),
       codeBlock('sudo caddyweb user passwd alex        # set a new password (asks for it)\nsudo caddyweb user list\nsudo caddyweb user add alice --role power\nsudo caddyweb user role alice admin\nsudo caddyweb user delete alice'),
@@ -110,9 +111,11 @@ function sections() {
     ] },
     { id: 'uninstall', title: 'Uninstalling', icon: 'trash', body: [
       P('Caddy never depends on CaddyWeb. Your Caddyfile is a normal Caddyfile, so you can stop using CaddyWeb at any time.'),
-      P('Remove the agent from a Caddy server (keeps the Caddyfile and backups):'),
+      P('First remove the agent from each Caddy server (keeps the Caddyfile and backups):'),
       codeBlock(`curl -fsSL ${origin}/agent/install.sh | sudo bash -s -- --uninstall`),
-      P('Remove CaddyWeb itself: ', C('sudo systemctl disable --now caddyweb'), ', delete ', C('/usr/local/bin/caddyweb'), ' and (optionally) ', C('/var/lib/caddyweb'), '. With Docker: ', C('docker rm -f caddyweb'), '.'),
+      P('Then remove CaddyWeb itself (add ', C('--purge'), ' to also delete its data):'),
+      codeBlock('curl -fsSL https://raw.githubusercontent.com/mf-ky/caddy-web-interface/main/scripts/install.sh | sudo bash -s -- --uninstall'),
+      P('With Docker: ', C('docker compose down'), ' (add ', C('-v'), ' to delete the data volume).'),
     ] },
   ];
 }

@@ -27,6 +27,19 @@ func isPlaceholder(tok string) bool {
 	return strings.HasPrefix(t, "{env.") || strings.HasPrefix(t, "{$")
 }
 
+// sensitive header names whose values are hidden from non-admins
+var secretHeaders = []string{"authorization", "token", "secret", "api-key", "apikey", "password", "cookie", "x-auth"}
+
+func isSecretHeader(field string) bool {
+	f := strings.ToLower(strings.TrimLeft(Unquote(field), "+-?>"))
+	for _, s := range secretHeaders {
+		if strings.Contains(f, s) {
+			return true
+		}
+	}
+	return false
+}
+
 func maskTok(tok string) string {
 	if isPlaceholder(tok) {
 		return tok
@@ -47,10 +60,10 @@ func redact(nodes []*Node, inSecretBlock bool) {
 		if n.Type != "directive" || len(n.Tokens) == 0 {
 			continue
 		}
-		name := n.Tokens[0]
+		name := Unquote(n.Tokens[0])
 		secretBlock := inSecretBlock
 		switch name {
-		case "acme_dns", "dns":
+		case "acme_dns", "dns", "dynamic_dns", "provider", "issuer", "cert_issuer", "acme_ca_root":
 			// acme_dns <provider> [args...] { ... }
 			for i := 2; i < len(n.Tokens); i++ {
 				n.Tokens[i] = maskTok(n.Tokens[i])
@@ -61,6 +74,25 @@ func redact(nodes []*Node, inSecretBlock bool) {
 			if name == "acme_eab" {
 				for i := 1; i < len(n.Tokens); i++ {
 					n.Tokens[i] = maskTok(n.Tokens[i])
+				}
+			}
+		case "header_up", "header_down", "header", "request_header":
+			// header [matcher] Field value… — hide values of sensitive headers
+			for i := 1; i < len(n.Tokens)-1; i++ {
+				if isSecretHeader(n.Tokens[i]) {
+					for j := i + 1; j < len(n.Tokens); j++ {
+						n.Tokens[j] = maskTok(n.Tokens[j])
+					}
+					break
+				}
+			}
+			if name == "header" && n.Block != nil {
+				for _, c := range n.Block {
+					if c.Type == "directive" && len(c.Tokens) > 1 && isSecretHeader(c.Tokens[0]) {
+						for j := 1; j < len(c.Tokens); j++ {
+							c.Tokens[j] = maskTok(c.Tokens[j])
+						}
+					}
 				}
 			}
 		default:
@@ -104,4 +136,47 @@ func RedactText(src string) string {
 		}
 	}
 	return doc.String()
+}
+
+// SecretValues lists every value RedactText would hide in src, so error
+// messages shown to non-admins can be scrubbed as well.
+func SecretValues(src string) []string {
+	doc, err := Parse(src)
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, sg := range doc.Segments() {
+		red := RedactNodes(sg.Nodes)
+		var walk func(a, b []*Node)
+		walk = func(a, b []*Node) {
+			for i := range a {
+				if i >= len(b) {
+					return
+				}
+				for j := range a[i].Tokens {
+					if j < len(b[i].Tokens) && a[i].Tokens[j] != b[i].Tokens[j] {
+						for _, v := range []string{a[i].Tokens[j], Unquote(a[i].Tokens[j])} {
+							if len(v) >= 4 && !seen[v] {
+								seen[v] = true
+								out = append(out, v)
+							}
+						}
+					}
+				}
+				walk(a[i].Block, b[i].Block)
+			}
+		}
+		walk(sg.Nodes, red)
+	}
+	return out
+}
+
+// Scrub replaces every secret value in s with Mask.
+func Scrub(s string, secrets []string) string {
+	for _, v := range secrets {
+		s = strings.ReplaceAll(s, v, Mask)
+	}
+	return s
 }

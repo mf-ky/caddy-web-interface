@@ -253,6 +253,60 @@ func TestEndToEnd(t *testing.T) {
 		}
 	}
 
+	// review regressions: power users can't inject structure, use imports or
+	// placeholders, take over live addresses, or read secrets via errors
+	st = p.ok("GET", "/api/servers/"+ida+"/state", nil)
+	rev = int64(st["rev"].(float64))
+	attacks := []map[string]any{
+		{"segment": map[string]any{"kind": "site", "header": []string{":18091"}, "headerComment": "# x\n}\n(pwn) {\n\trespond pwned\n}\n\nhttp://z {", "nodes": []any{}}},
+		{"segment": map[string]any{"kind": "site", "header": []string{":18092"}, "nodes": []any{map[string]any{"type": "comment", "text": "# hi\n}\nevil.localhost {"}}}},
+		{"segment": map[string]any{"kind": "site", "header": []string{"(snip)"}, "nodes": []any{}}},
+		{"segment": map[string]any{"kind": "site", "header": []string{":18093"}, "nodes": []any{map[string]any{"type": "directive", "tokens": []string{"import", "/etc/hostname"}}}}},
+		{"segment": map[string]any{"kind": "site", "header": []string{":18094"}, "nodes": []any{map[string]any{"type": "directive", "tokens": []string{"respond", "{$HOME}"}}}}},
+		{"segment": map[string]any{"kind": "site", "header": []string{":18081"}, "nodes": []any{map[string]any{"type": "directive", "tokens": []string{"respond", "taken"}}}}},
+		{"segment": map[string]any{"kind": "site", "header": []string{":18095"}, "nodes": []any{map[string]any{"type": "directive", "tokens": []string{"respond", "a\"\n}\nevil {\n\trespond x\""}}}}},
+	}
+	for i, a := range attacks {
+		if code, out := p.do("POST", fmt.Sprintf("/api/servers/%s/draft/segments?rev=%d", ida, rev), a); code == 200 {
+			t.Fatalf("attack %d accepted: %v", i, out["segments"])
+		}
+	}
+	// secrets in admin cards never reach a power user through validate errors
+	st = c.ok("GET", "/api/servers/"+ida+"/state", nil)
+	secret := map[string]any{"segment": map[string]any{"kind": "site", "header": []string{":18096"},
+		"nodes": []any{map[string]any{"type": "directive", "tokens": []string{"reverse_proxy", "localhost:1"}, "block": []any{
+			map[string]any{"type": "directive", "tokens": []string{"header_up", "X-Api-Token", "SECRETTOKEN123"}},
+			map[string]any{"type": "directive", "tokens": []string{"bogus_directive"}},
+		}}}}}
+	c.ok("POST", fmt.Sprintf("/api/servers/%s/draft/segments?rev=%v", ida, st["rev"]), secret)
+	code, e = p.do("POST", "/api/servers/"+ida+"/validate", nil)
+	if code == 200 {
+		t.Fatal("expected validation error")
+	}
+	if b, _ := json.Marshal(e); strings.Contains(string(b), "SECRETTOKEN123") {
+		t.Fatalf("secret leaked to power user: %s", b)
+	}
+	if code, e = c.do("POST", "/api/servers/"+ida+"/validate", nil); code == 200 || e["context"] == nil {
+		t.Fatalf("admin should see context: %d %v", code, e)
+	}
+	st = c.ok("GET", "/api/servers/"+ida+"/state", nil)
+	c.ok("POST", fmt.Sprintf("/api/servers/%s/draft/discard?rev=%v", ida, st["rev"]), nil)
+
+	// a server whose Caddyfile was never read can't be edited (applying a
+	// draft built from nothing would wipe the real file)
+	broken := c.ok("POST", "/api/servers", map[string]any{"name": "Broken", "connection": map[string]any{"mode": "local", "agentPath": "/nonexistent/agent"}})
+	if code, _ := c.do("POST", fmt.Sprintf("/api/servers/%s/draft/segments?rev=0", broken["id"]), newSeg); code != 409 {
+		t.Fatalf("edit of unread server allowed: %d", code)
+	}
+	st = c.ok("GET", "/api/servers/"+ida+"/state", nil)
+	for _, sg := range st["segments"].([]any) {
+		if m := sg.(map[string]any); m["key"] == "site::18081" {
+			if code, _ := c.do("POST", fmt.Sprintf("/api/servers/%s/draft/segments/%v/copy?key=site::18081", ida, m["id"]), map[string]string{"target": broken["id"].(string)}); code != 409 {
+				t.Fatalf("copy to unread server allowed: %d", code)
+			}
+		}
+	}
+
 	// password reset from the "CLI" (store) logs the session out
 	if err := srv.users.SetPassword("power", "another-pass-2"); err != nil {
 		t.Fatal(err)

@@ -10,6 +10,8 @@ package caddyfile
 import (
 	"fmt"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // TokenKind classifies a lexed token.
@@ -61,6 +63,11 @@ func Lex(src string) ([]Token, error) {
 		case c == ' ' || c == '\t' || c == '\r':
 			i++
 			continue
+		case c >= utf8.RuneSelf && isUnicodeSpace(src[i:]):
+			// Caddy splits on any Unicode space (NBSP, …), so do we
+			_, size := utf8.DecodeRuneInString(src[i:])
+			i += size
+			continue
 		case c == '\\' && i+1 < n && (src[i+1] == '\n' || (src[i+1] == '\r' && i+2 < n && src[i+2] == '\n')):
 			// line continuation: swallow the backslash and the newline
 			if src[i+1] == '\r' {
@@ -89,38 +96,40 @@ func Lex(src string) ([]Token, error) {
 			}
 		}
 
-		// A word, possibly containing quoted or backtick sections.
+		// A word. Like Caddy, a quote or backtick only starts a quoted token
+		// at the very beginning of a word; elsewhere it is an ordinary character.
 		start := i
 		startLine := line
+		if c == '"' || c == '`' {
+			q := c
+			i++
+			for i < n && src[i] != q {
+				if q == '"' && src[i] == '\\' && i+1 < n && src[i+1] == '"' {
+					i += 2
+					continue
+				}
+				if src[i] == '\n' {
+					line++
+				}
+				i++
+			}
+			if i >= n {
+				return nil, &SyntaxError{Line: startLine, Msg: "unterminated quoted string"}
+			}
+			i++ // closing quote
+			toks = append(toks, Token{Kind: TokWord, Text: src[start:i], Line: startLine, Start: start, End: i})
+			continue
+		}
 		for i < n {
 			c = src[i]
-			if c == '"' || c == '`' {
-				q := c
-				i++
-				for i < n && src[i] != q {
-					if q == '"' && src[i] == '\\' && i+1 < n {
-						if src[i+1] == '\n' {
-							line++
-						}
-						i += 2
-						continue
-					}
-					if src[i] == '\n' {
-						line++
-					}
-					i++
-				}
-				if i >= n {
-					return nil, &SyntaxError{Line: startLine, Msg: "unterminated quoted string"}
-				}
-				i++ // closing quote
-				continue
-			}
 			if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
 				break
 			}
-			if c == '\\' && i+1 < n && src[i+1] == '\n' {
+			if c >= utf8.RuneSelf && isUnicodeSpace(src[i:]) {
 				break
+			}
+			if c == '\\' && i+1 < n && (src[i+1] == '\n' || (src[i+1] == '\r' && i+2 < n && src[i+2] == '\n')) {
+				break // line continuation
 			}
 			i++
 		}
@@ -170,9 +179,15 @@ func lexHeredoc(src string, i, line int) (Token, int, int, bool) {
 		} else {
 			ln = src[pos : pos+end]
 		}
-		if strings.TrimSpace(ln) == marker {
-			stop := pos + strings.Index(ln, marker) + len(marker)
-			return Token{Kind: TokWord, Text: src[i:stop], Line: line, Start: i, End: stop}, stop, lines, true
+		// The closing line is the marker, optionally followed by more tokens
+		// on the same line (e.g. "HTML 200").
+		trimmed := strings.TrimLeft(ln, " \t")
+		if strings.HasPrefix(trimmed, marker) {
+			rest := trimmed[len(marker):]
+			if rest == "" || rest[0] == ' ' || rest[0] == '\t' || rest[0] == '\r' {
+				stop := pos + (len(ln) - len(trimmed)) + len(marker)
+				return Token{Kind: TokWord, Text: src[i:stop], Line: line, Start: i, End: stop}, stop, lines, true
+			}
 		}
 		if pos+end >= len(src) {
 			break
@@ -181,4 +196,9 @@ func lexHeredoc(src string, i, line int) (Token, int, int, bool) {
 		lines++
 	}
 	return Token{}, 0, 0, false
+}
+
+func isUnicodeSpace(s string) bool {
+	r, _ := utf8.DecodeRuneInString(s)
+	return unicode.IsSpace(r)
 }

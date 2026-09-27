@@ -38,6 +38,9 @@ func ResolveRaw(nodes []*Node) ([]*Node, error) {
 			if !strings.HasPrefix(t, "#") {
 				t = "# " + t
 			}
+			if err := checkComment(t); err != nil {
+				return nil, err
+			}
 			n.Text = t
 			n.Tokens = nil
 			n.Block = nil
@@ -54,9 +57,12 @@ func ResolveRaw(nodes []*Node) ([]*Node, error) {
 			n.Tokens[i] = tok
 		}
 		if n.Comment != "" {
-			c := strings.TrimSpace(strings.ReplaceAll(n.Comment, "\n", " "))
+			c := strings.TrimSpace(n.Comment)
 			if !strings.HasPrefix(c, "#") {
 				c = "# " + c
+			}
+			if err := checkComment(c); err != nil {
+				return nil, err
 			}
 			n.Comment = c
 		}
@@ -79,12 +85,33 @@ func checkToken(tok string) error {
 	if tok == "" {
 		return fmt.Errorf("empty value")
 	}
+	if strings.ContainsAny(tok, "\r\n") && !strings.HasPrefix(tok, "<<") {
+		return fmt.Errorf("value %q may not contain line breaks", firstLine(tok))
+	}
+	if strings.HasPrefix(tok, "<<") && !strings.Contains(tok, "\n") {
+		return fmt.Errorf("value %q can't start with <<", tok)
+	}
+	if strings.HasSuffix(tok, "\\") {
+		return fmt.Errorf("value %q can't end with a backslash", tok)
+	}
 	toks, err := Lex(tok)
 	if err != nil {
 		return err
 	}
-	if len(toks) != 1 || toks[0].Kind != TokWord {
+	if len(toks) != 1 || toks[0].Kind != TokWord || toks[0].Text != tok {
 		return fmt.Errorf("value %q must be a single word; wrap it in double quotes if it contains spaces", tok)
+	}
+	return nil
+}
+
+// checkComment makes sure a comment from the UI is exactly one line.
+func checkComment(c string) error {
+	if strings.ContainsAny(c, "\r\n") {
+		return fmt.Errorf("comments must be a single line")
+	}
+	toks, err := Lex(c)
+	if err != nil || len(toks) != 1 || toks[0].Kind != TokComment {
+		return fmt.Errorf("invalid comment %q", c)
 	}
 	return nil
 }
@@ -103,12 +130,15 @@ func firstLine(s string) string {
 // CheckSegment validates a segment built by the UI before it is written.
 func CheckSegment(s *Segment) error {
 	for i, c := range s.Comments {
-		c = strings.TrimSpace(strings.ReplaceAll(c, "\n", " "))
+		c = strings.TrimSpace(c)
 		if c == "" {
 			continue
 		}
 		if !strings.HasPrefix(c, "#") {
 			c = "# " + c
+		}
+		if err := checkComment(c); err != nil {
+			return err
 		}
 		s.Comments[i] = c
 	}
@@ -120,8 +150,16 @@ func CheckSegment(s *Segment) error {
 		}
 	}
 	s.Comments = cs
-	if s.HeaderComment != "" && !strings.HasPrefix(strings.TrimSpace(s.HeaderComment), "#") {
-		s.HeaderComment = "# " + strings.TrimSpace(s.HeaderComment)
+	if hc := strings.TrimSpace(s.HeaderComment); hc != "" {
+		if !strings.HasPrefix(hc, "#") {
+			hc = "# " + hc
+		}
+		if err := checkComment(hc); err != nil {
+			return err
+		}
+		s.HeaderComment = hc
+	} else {
+		s.HeaderComment = ""
 	}
 	switch s.Kind {
 	case KindGlobal:
@@ -137,6 +175,20 @@ func CheckSegment(s *Segment) error {
 			if h == "{" || h == "}" {
 				return fmt.Errorf("address may not be a brace")
 			}
+		}
+		// The kind must match what the header means when the file is read back.
+		h0 := s.Header[0]
+		isSnippet := len(s.Header) == 1 && strings.HasPrefix(h0, "(") && strings.HasSuffix(h0, ")")
+		isRoute := strings.HasPrefix(h0, "&(")
+		switch {
+		case s.Kind == KindSite && (isSnippet || isRoute || h0 == "import"):
+			return fmt.Errorf("%q is not a site address", h0)
+		case s.Kind == KindSnippet && !isSnippet:
+			return fmt.Errorf("a snippet name must look like (name)")
+		case s.Kind == KindNamedRoute && !isRoute:
+			return fmt.Errorf("a named route must look like &(name)")
+		case s.Kind == KindDirective && h0 != "import":
+			return fmt.Errorf("only top-level import lines are supported")
 		}
 	default:
 		return fmt.Errorf("unknown block kind %q", s.Kind)

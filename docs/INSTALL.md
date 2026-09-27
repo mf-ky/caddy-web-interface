@@ -22,7 +22,7 @@ explanations; you don't need to type them.
 ## What you need
 
 * A Linux machine for CaddyWeb (Debian, Ubuntu, DietPi, Raspberry Pi OS…;
-  64-bit PC or Raspberry Pi), **or** any machine with Docker.
+  PC or any Raspberry Pi: amd64, arm64, armv7, armv6), **or** any machine with Docker.
 * Your Caddy server(s), installed as a normal service
   (`/etc/caddy/Caddyfile`, `systemctl status caddy` works).
 * SSH access to the Caddy server (you already use this to edit the Caddyfile).
@@ -34,6 +34,10 @@ explanations; you don't need to type them.
 Pick **one** of the options.
 
 ### Option A: Linux service (recommended)
+
+> **Note:** this downloads a published release from GitHub. If the command
+> says the download failed, no release has been published yet — use Option B
+> or C until one exists.
 
 Log in to the machine that will run CaddyWeb and run:
 
@@ -55,12 +59,16 @@ cd caddy-web-interface
 docker compose up -d --build
 ```
 
-CaddyWeb is now on port 8090 of that machine. Its data lives in the Docker
-volume `caddyweb-data`.
+CaddyWeb is now on port 8090 of that machine. Its data lives in a Docker
+volume (named `caddy-web-interface_caddyweb-data`).
+
+> With Docker, “this machine” inside the container is the container itself.
+> When you add a Caddy server that runs on the same computer as Docker, use
+> that computer's **LAN IP address** (e.g. `192.168.0.10`), not `127.0.0.1`.
 
 ### Option C: Build it yourself
 
-With Go 1.24+ installed: `make build` produces a single `caddyweb` binary.
+With Go 1.24.7 or newer (plus git and make) installed: `make build` produces a single `caddyweb` binary.
 Then `sudo CADDYWEB_BINARY=./caddyweb bash scripts/install.sh` installs it as
 a service.
 
@@ -90,7 +98,7 @@ asks you to create the **admin** account. Choose a username and a password
    Open a terminal **on the Caddy server** (e.g. `ssh you@192.168.0.10`) and
    run that command. It prints what it does and ends with **“All done!”** and
    one or more *fingerprints* such as
-   `256 SHA256:UZZ5++E340eKRG0rpb7EPxrB2Ebl6S4Ph2OHbeKx2bg root@DietPi (ED25519)`.
+   `SHA256:UZZ5++E340eKRG0rpb7EPxrB2Ebl6S4Ph2OHbeKx2bg  (ssh-ed25519)`.
 
    *Want to read the script before running it?* Open
    `http://<caddyweb-ip>:8090/agent/install.sh` in your browser first.
@@ -105,9 +113,10 @@ command works for all of them.
 
 ### CaddyWeb on the same machine as Caddy?
 
-That works too. The easiest way is to follow step 3 normally and use
-`127.0.0.1` as the IP address. (If you installed CaddyWeb with Option A, the
-agent installer reuses the existing `caddyweb` user.)
+That works too. Install CaddyWeb first (Option A), then follow step 3
+normally and use `127.0.0.1` as the IP address. The agent installer reuses the
+`caddyweb` user that CaddyWeb created. (With Docker, use the machine's LAN IP
+instead — see the note under Option B.)
 
 ---
 
@@ -144,8 +153,10 @@ see your new block, written just like you'd write it by hand.
 ## Optional extras
 
 * **More users** — *Users* page. Roles: **Admin** (everything), **Power User**
-  (can view everything and add new cards; can't change or delete live cards,
-  apply or restore), **User** (read only).
+  (sees all cards and can add new site cards; can't change or delete live
+  cards, apply, restore, or see passwords/API keys), **User** (read only,
+  passwords/API keys hidden). On the command line these roles are called
+  `admin`, `power` and `viewer`.
 * **Backups** — every Apply/Restore saves the previous Caddyfile in
   `/etc/caddy/backups/` on the Caddy server (and a copy inside CaddyWeb). Set
   how many to keep in *Settings*. You can also have CaddyWeb copy them to a NAS
@@ -154,9 +165,13 @@ see your new block, written just like you'd write it by hand.
 * **DNS provider for certificates** — *Global settings* card → *Use a DNS
   provider*. CaddyWeb shows which providers are installed in your Caddy and the
   exact command to add a missing one.
-* **HTTPS for CaddyWeb itself** — `caddyweb serve --tls-cert cert.pem --tls-key key.pem`
-  (add the flags to `ExecStart` in `/etc/systemd/system/caddyweb.service`),
-  or put CaddyWeb behind Caddy. Keep port 8090 reachable on your LAN as well,
+* **HTTPS for CaddyWeb itself** — run `sudo systemctl edit caddyweb`, add
+  ```
+  [Service]
+  Environment=CADDYWEB_TLS_CERT=/path/cert.pem CADDYWEB_TLS_KEY=/path/key.pem
+  ```
+  and `sudo systemctl restart caddyweb` (this survives upgrades), or put
+  CaddyWeb behind Caddy. Keep port 8090 reachable on your LAN as well,
   so a broken Caddyfile can never lock you out of the tool that fixes it.
 
 ---
@@ -177,7 +192,8 @@ Docker: `docker exec -it caddyweb caddyweb user passwd alex`
 
 ## Updating
 
-* **Option A**: run the install command from step 1 again. Your data is kept.
+* **Option A**: run the install command from step 1 again. Your data and port
+  are kept (other customisations belong in `sudo systemctl edit caddyweb`).
 * **Option B**: `cd caddy-web-interface && git pull && docker compose up -d --build`.
 
 ---
@@ -186,12 +202,20 @@ Docker: `docker exec -it caddyweb caddyweb user passwd alex`
 
 Caddy never depends on CaddyWeb — your Caddyfile is a normal Caddyfile.
 
-* Remove the agent from a Caddy server (keeps the Caddyfile and backups):
-  ```bash
-  curl -fsSL http://<caddyweb-ip>:8090/agent/install.sh | sudo bash -s -- --uninstall
-  ```
-* Remove CaddyWeb (Option A): `sudo bash install.sh --uninstall`
-  (add `--purge` to also delete its data). Docker: `docker compose down -v`.
+Do it in this order:
+
+1. Remove the agent from each Caddy server (keeps the Caddyfile and backups,
+   and puts the Caddyfile's original permissions back):
+   ```bash
+   curl -fsSL http://<caddyweb-ip>:8090/agent/install.sh | sudo bash -s -- --uninstall
+   ```
+2. Remove CaddyWeb (Option A):
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/mf-ky/caddy-web-interface/main/scripts/install.sh | sudo bash -s -- --uninstall
+   ```
+   Add `--purge` after `--uninstall` to also delete its data and the
+   `caddyweb` user. Docker: `docker compose down` (add `-v` to delete the data
+   volume too).
 
 ---
 
