@@ -26,32 +26,32 @@ func shaOf(s string) string {
 
 // syncLive reads the Caddyfile from the server (at most every few seconds
 // unless force is set) and caches it.
-func (s *Server) syncLive(ctx context.Context, force bool) (store.Live, *remote.CaddyError) {
-	s.cacheMu.Lock()
-	defer s.cacheMu.Unlock()
-	cached := s.state.Live()
-	if !s.client.Config().Configured() {
+func (sc *serverCtx) syncLive(ctx context.Context, force bool) (store.Live, *remote.CaddyError) {
+	sc.cacheMu.Lock()
+	defer sc.cacheMu.Unlock()
+	cached := sc.st.Live()
+	if !sc.client.Config().Configured() {
 		return cached, &remote.CaddyError{Kind: "notconfigured", Message: "CaddyWeb is not connected to a Caddy server yet."}
 	}
-	if !force && time.Since(s.lastFetch) < 3*time.Second {
-		return cached, s.liveErr
+	if !force && time.Since(sc.lastFetch) < 3*time.Second {
+		return cached, sc.liveErr
 	}
-	s.lastFetch = time.Now()
-	text, err := s.client.Read(ctx)
+	sc.lastFetch = time.Now()
+	text, err := sc.client.Read(ctx)
 	if err != nil {
-		s.liveErr = remote.Explain(err)
-		return cached, s.liveErr
+		sc.liveErr = remote.Explain(err)
+		return cached, sc.liveErr
 	}
 	live := store.Live{Text: text, SHA: shaOf(text), Fetched: time.Now()}
-	_ = s.state.SetLive(live)
-	s.liveErr = nil
+	_ = sc.st.SetLive(live)
+	sc.liveErr = nil
 	return live, nil
 }
 
 // currentDraft reconciles the saved draft with the live file. Callers must
 // hold draftMu.
-func (s *Server) currentDraft(live store.Live) store.Draft {
-	d := s.state.Draft()
+func (sc *serverCtx) currentDraft(live store.Live) store.Draft {
+	d := sc.st.Draft()
 	if live.SHA == "" {
 		return d
 	}
@@ -72,7 +72,7 @@ func (s *Server) currentDraft(live store.Live) store.Draft {
 	}
 	if changed {
 		d.Rev++
-		_ = s.state.SetDraft(d)
+		_ = sc.st.SetDraft(d)
 	}
 	return d
 }
@@ -120,24 +120,24 @@ type stateView struct {
 	Retention  int            `json:"retention"`
 }
 
-func (s *Server) cachedInfo(ctx context.Context) *remote.Info {
-	s.cacheMu.Lock()
-	defer s.cacheMu.Unlock()
-	if s.info != nil && time.Since(s.infoAt) < time.Minute {
-		return s.info
+func (sc *serverCtx) cachedInfo(ctx context.Context) *remote.Info {
+	sc.cacheMu.Lock()
+	defer sc.cacheMu.Unlock()
+	if sc.info != nil && time.Since(sc.infoAt) < time.Minute {
+		return sc.info
 	}
-	info, err := s.client.Info(ctx)
+	info, err := sc.client.Info(ctx)
 	if err == nil {
-		s.info, s.infoAt = info, time.Now()
+		sc.info, sc.infoAt = info, time.Now()
 	}
-	return s.info
+	return sc.info
 }
 
-func (s *Server) buildState(ctx context.Context, u *store.User, live store.Live, liveErr *remote.CaddyError, d store.Draft) stateView {
-	cfg := s.client.Config()
+func (sc *serverCtx) buildState(ctx context.Context, u *store.User, live store.Live, liveErr *remote.CaddyError, d store.Draft) stateView {
+	cfg := sc.client.Config()
 	v := stateView{
 		Rev: d.Rev, Log: d.Log, Segments: []segView{}, Deleted: []segView{}, Domains: []string{},
-		Retention: s.state.Settings().BackupRetention,
+		Retention: sc.srv.state.Settings().BackupRetention,
 		Connection: connView{
 			Configured: cfg.Configured(), OK: liveErr == nil && live.SHA != "", Mode: cfg.Mode, Host: cfg.Host,
 			Error: liveErr, Fetched: live.Fetched,
@@ -147,7 +147,7 @@ func (s *Server) buildState(ctx context.Context, u *store.User, live store.Live,
 		v.Log = []store.Change{}
 	}
 	if v.Connection.OK {
-		v.Connection.Info = s.cachedInfo(ctx)
+		v.Connection.Info = sc.cachedInfo(ctx)
 	}
 	if d.Text == "" && live.SHA == "" {
 		return v
@@ -176,7 +176,7 @@ func (s *Server) buildState(ctx context.Context, u *store.User, live store.Live,
 	for i, sg := range doc.Segments() {
 		key := sg.Key()
 		present[key] = true
-		sv := s.segToView(sg, doc.Indent, isAdmin)
+		sv := segToView(sg, doc.Indent, isAdmin)
 		sv.ID, sv.StartLine, sv.EndLine = i, lines[sg][0], lines[sg][1]
 		sv.CreatedBy = d.Creators[key]
 		if ls, ok := liveSegs[key]; !ok {
@@ -202,7 +202,7 @@ func (s *Server) buildState(ctx context.Context, u *store.User, live store.Live,
 	}
 	for _, ls := range liveOrder {
 		if !present[ls.Key()] {
-			sv := s.segToView(ls, doc.Indent, isAdmin)
+			sv := segToView(ls, doc.Indent, isAdmin)
 			sv.Status, sv.ID = "deleted", -1
 			v.Deleted = append(v.Deleted, sv)
 		}
@@ -219,7 +219,7 @@ func (s *Server) buildState(ctx context.Context, u *store.User, live store.Live,
 	return v
 }
 
-func (s *Server) segToView(sg *caddyfile.Segment, indent string, isAdmin bool) segView {
+func segToView(sg *caddyfile.Segment, indent string, isAdmin bool) segView {
 	shown := sg
 	if !isAdmin {
 		shown = caddyfile.RedactSegment(sg)
@@ -258,13 +258,13 @@ func baseDomain(addr string) string {
 	return strings.Join(parts[len(parts)-2:], ".")
 }
 
-func (s *Server) handleState(w http.ResponseWriter, r *http.Request, u *store.User) {
+func (s *Server) handleState(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
 	force := r.URL.Query().Get("refresh") == "1"
-	live, liveErr := s.syncLive(r.Context(), force)
-	s.draftMu.Lock()
-	d := s.currentDraft(live)
-	s.draftMu.Unlock()
-	writeJSON(w, s.buildState(r.Context(), u, live, liveErr, d))
+	live, liveErr := sc.syncLive(r.Context(), force)
+	sc.draftMu.Lock()
+	d := sc.currentDraft(live)
+	sc.draftMu.Unlock()
+	writeJSON(w, sc.buildState(r.Context(), u, live, liveErr, d))
 }
 
 // ---- mutations ----
@@ -284,15 +284,15 @@ func badRequest(format string, a ...any) error {
 func forbidden(msg string) error { return &httpError{code: http.StatusForbidden, msg: msg} }
 
 // mutate runs fn against a parsed copy of the draft and saves the result.
-func (s *Server) mutate(w http.ResponseWriter, r *http.Request, u *store.User, fn func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error)) {
+func (s *Server) mutate(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx, fn func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error)) {
 	rev, _ := strconv.ParseInt(r.URL.Query().Get("rev"), 10, 64)
-	live, liveErr := s.syncLive(r.Context(), false)
+	live, liveErr := sc.syncLive(r.Context(), false)
 
-	s.draftMu.Lock()
-	defer s.draftMu.Unlock()
-	d := s.currentDraft(live)
+	sc.draftMu.Lock()
+	defer sc.draftMu.Unlock()
+	d := sc.currentDraft(live)
 	if rev != d.Rev {
-		writeErrData(w, http.StatusConflict, "The draft was changed somewhere else (another user or browser tab). Your view has been refreshed — please try again.", map[string]any{"state": s.buildState(r.Context(), u, live, liveErr, d)})
+		writeErrData(w, http.StatusConflict, "The draft was changed somewhere else (another user or browser tab). Your view has been refreshed — please try again.", map[string]any{"state": sc.buildState(r.Context(), u, live, liveErr, d)})
 		return
 	}
 	doc, err := caddyfile.Parse(d.Text)
@@ -322,11 +322,11 @@ func (s *Server) mutate(w http.ResponseWriter, r *http.Request, u *store.User, f
 	if d.Creators == nil {
 		d.Creators = map[string]string{}
 	}
-	if err := s.state.SetDraft(d); err != nil {
+	if err := sc.st.SetDraft(d); err != nil {
 		writeErr(w, http.StatusInternalServerError, "saving draft: "+err.Error())
 		return
 	}
-	writeJSON(w, s.buildState(r.Context(), u, live, liveErr, d))
+	writeJSON(w, sc.buildState(r.Context(), u, live, liveErr, d))
 }
 
 func findSegment(doc *caddyfile.Document, r *http.Request) (*caddyfile.Segment, error) {
@@ -379,12 +379,12 @@ type segmentInput struct {
 	Text    string            `json:"text"`
 }
 
-func (s *Server) handleAddSegment(w http.ResponseWriter, r *http.Request, u *store.User) {
+func (s *Server) handleAddSegment(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
 	var in segmentInput
 	if !readJSON(w, r, &in) {
 		return
 	}
-	s.mutate(w, r, u, func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error) {
+	s.mutate(w, r, u, sc, func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error) {
 		sg := &in.Segment
 		if in.Text != "" {
 			parsed, err := caddyfile.ParseSegment(in.Text)
@@ -459,12 +459,12 @@ func (s *Server) replaceSegment(doc *caddyfile.Document, d *store.Draft, u *stor
 	return store.Change{Action: "edited", Target: label(sg)}, nil
 }
 
-func (s *Server) handleUpdateSegment(w http.ResponseWriter, r *http.Request, u *store.User) {
+func (s *Server) handleUpdateSegment(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
 	var in segmentInput
 	if !readJSON(w, r, &in) {
 		return
 	}
-	s.mutate(w, r, u, func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error) {
+	s.mutate(w, r, u, sc, func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error) {
 		old, err := findSegment(doc, r)
 		if err != nil {
 			return store.Change{}, err
@@ -480,12 +480,12 @@ func (s *Server) handleUpdateSegment(w http.ResponseWriter, r *http.Request, u *
 	})
 }
 
-func (s *Server) handleUpdateSegmentRaw(w http.ResponseWriter, r *http.Request, u *store.User) {
+func (s *Server) handleUpdateSegmentRaw(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
 	var in segmentInput
 	if !readJSON(w, r, &in) {
 		return
 	}
-	s.mutate(w, r, u, func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error) {
+	s.mutate(w, r, u, sc, func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error) {
 		old, err := findSegment(doc, r)
 		if err != nil {
 			return store.Change{}, err
@@ -504,8 +504,8 @@ func (s *Server) handleUpdateSegmentRaw(w http.ResponseWriter, r *http.Request, 
 	})
 }
 
-func (s *Server) handleDeleteSegment(w http.ResponseWriter, r *http.Request, u *store.User) {
-	s.mutate(w, r, u, func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error) {
+func (s *Server) handleDeleteSegment(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
+	s.mutate(w, r, u, sc, func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error) {
 		sg, err := findSegment(doc, r)
 		if err != nil {
 			return store.Change{}, err
@@ -529,8 +529,8 @@ func liveSegment(live store.Live, key string) (*caddyfile.Segment, *caddyfile.Do
 	return nil, ldoc
 }
 
-func (s *Server) handleRevertSegment(w http.ResponseWriter, r *http.Request, u *store.User) {
-	s.mutate(w, r, u, func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error) {
+func (s *Server) handleRevertSegment(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
+	s.mutate(w, r, u, sc, func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error) {
 		sg, err := findSegment(doc, r)
 		if err != nil {
 			return store.Change{}, err
@@ -546,14 +546,14 @@ func (s *Server) handleRevertSegment(w http.ResponseWriter, r *http.Request, u *
 	})
 }
 
-func (s *Server) handleRestoreDeleted(w http.ResponseWriter, r *http.Request, u *store.User) {
+func (s *Server) handleRestoreDeleted(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
 	var in struct {
 		Key string `json:"key"`
 	}
 	if !readJSON(w, r, &in) {
 		return
 	}
-	s.mutate(w, r, u, func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error) {
+	s.mutate(w, r, u, sc, func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error) {
 		ls, ldoc := liveSegment(live, in.Key)
 		if ls == nil {
 			return store.Change{}, badRequest("That block is not in the live Caddyfile.")
@@ -586,12 +586,12 @@ func (s *Server) handleRestoreDeleted(w http.ResponseWriter, r *http.Request, u 
 	})
 }
 
-func (s *Server) handleDraftRaw(w http.ResponseWriter, r *http.Request, u *store.User) {
+func (s *Server) handleDraftRaw(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
 	var in segmentInput
 	if !readJSON(w, r, &in) {
 		return
 	}
-	s.mutate(w, r, u, func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error) {
+	s.mutate(w, r, u, sc, func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error) {
 		if strings.TrimSpace(in.Text) == "" {
 			return store.Change{}, badRequest("The Caddyfile can't be empty.")
 		}
@@ -610,8 +610,8 @@ func (s *Server) handleDraftRaw(w http.ResponseWriter, r *http.Request, u *store
 	})
 }
 
-func (s *Server) handleDiscard(w http.ResponseWriter, r *http.Request, u *store.User) {
-	s.mutate(w, r, u, func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error) {
+func (s *Server) handleDiscard(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
+	s.mutate(w, r, u, sc, func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error) {
 		if live.SHA == "" {
 			return store.Change{}, badRequest("Can't discard without a connection to the Caddy server.")
 		}
@@ -628,20 +628,20 @@ func (s *Server) handleDiscard(w http.ResponseWriter, r *http.Request, u *store.
 
 // handleRebase keeps the draft even though the server file changed, so the
 // next Apply replaces the server's version.
-func (s *Server) handleRebase(w http.ResponseWriter, r *http.Request, u *store.User) {
-	s.mutate(w, r, u, func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error) {
+func (s *Server) handleRebase(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
+	s.mutate(w, r, u, sc, func(doc *caddyfile.Document, d *store.Draft, live store.Live) (store.Change, error) {
 		d.BaseSHA = live.SHA
 		return store.Change{Action: "kept draft over server changes", Target: "Caddyfile"}, nil
 	})
 }
 
-func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request, u *store.User) {
+func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
 	var in segmentInput
 	if !readJSON(w, r, &in) {
 		return
 	}
 	indent := "\t"
-	if doc, err := caddyfile.Parse(s.state.Draft().Text); err == nil {
+	if doc, err := caddyfile.Parse(sc.st.Draft().Text); err == nil {
 		indent = doc.Indent
 	}
 	sg := &in.Segment
@@ -664,11 +664,11 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request, u *store.
 	writeJSON(w, map[string]any{"text": out.Format(indent), "segment": out})
 }
 
-func (s *Server) handleDraftDiff(w http.ResponseWriter, r *http.Request, u *store.User) {
-	live, _ := s.syncLive(r.Context(), false)
-	s.draftMu.Lock()
-	d := s.currentDraft(live)
-	s.draftMu.Unlock()
+func (s *Server) handleDraftDiff(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
+	live, _ := sc.syncLive(r.Context(), false)
+	sc.draftMu.Lock()
+	d := sc.currentDraft(live)
+	sc.draftMu.Unlock()
 	a, b := live.Text, d.Text
 	if u.Role != store.RoleAdmin {
 		a, b = caddyfile.RedactText(a), caddyfile.RedactText(b)
@@ -678,11 +678,11 @@ func (s *Server) handleDraftDiff(w http.ResponseWriter, r *http.Request, u *stor
 	writeJSON(w, map[string]any{"lines": diff.Hunks(lines, 3), "added": add, "removed": rem})
 }
 
-func (s *Server) handleCaddyfileText(w http.ResponseWriter, r *http.Request, u *store.User) {
-	live, liveErr := s.syncLive(r.Context(), false)
-	s.draftMu.Lock()
-	d := s.currentDraft(live)
-	s.draftMu.Unlock()
+func (s *Server) handleCaddyfileText(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
+	live, liveErr := sc.syncLive(r.Context(), false)
+	sc.draftMu.Lock()
+	d := sc.currentDraft(live)
+	sc.draftMu.Unlock()
 	text := d.Text
 	if r.URL.Query().Get("which") == "live" {
 		text = live.Text
@@ -690,11 +690,11 @@ func (s *Server) handleCaddyfileText(w http.ResponseWriter, r *http.Request, u *
 	if u.Role != store.RoleAdmin {
 		text = caddyfile.RedactText(text)
 	}
-	writeJSON(w, map[string]any{"text": text, "rev": d.Rev, "error": liveErr, "path": s.infoPath(r.Context())})
+	writeJSON(w, map[string]any{"text": text, "rev": d.Rev, "error": liveErr, "path": sc.infoPath(r.Context())})
 }
 
-func (s *Server) infoPath(ctx context.Context) string {
-	if info := s.cachedInfo(ctx); info != nil {
+func (sc *serverCtx) infoPath(ctx context.Context) string {
+	if info := sc.cachedInfo(ctx); info != nil {
 		return info.Caddyfile
 	}
 	return ""

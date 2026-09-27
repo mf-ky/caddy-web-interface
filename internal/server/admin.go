@@ -1,12 +1,10 @@
 package server
 
 import (
-	"errors"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/mf-ky/caddy-web-interface/internal/remote"
 	"github.com/mf-ky/caddy-web-interface/internal/store"
 )
 
@@ -29,19 +27,6 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request, u *st
 	if !readJSON(w, r, &in) {
 		return
 	}
-	c := in.Connection
-	c.Host = strings.TrimSpace(c.Host)
-	if c.Mode != "local" {
-		c.Mode = "ssh"
-	}
-	if c.Port < 0 || c.Port > 65535 {
-		writeErr(w, http.StatusBadRequest, "Port must be between 1 and 65535.")
-		return
-	}
-	if strings.ContainsAny(c.Host, " /@") {
-		writeErr(w, http.StatusBadRequest, "Host should be just a name or IP address, like 192.168.0.10.")
-		return
-	}
 	if in.BackupRetention < 1 || in.BackupRetention > 1000 {
 		writeErr(w, http.StatusBadRequest, "Keep between 1 and 1000 backups.")
 		return
@@ -49,15 +34,12 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request, u *st
 	if in.SessionHours < 1 {
 		in.SessionHours = 24 * 7
 	}
+	if in.Offsite.Port < 0 || in.Offsite.Port > 65535 {
+		writeErr(w, http.StatusBadRequest, "The rsync SSH port must be between 1 and 65535.")
+		return
+	}
 	prev := s.state.Settings()
 	set, err := s.state.UpdateSettings(func(st *store.Settings) {
-		// the host key is only changed through "trust"; reset it if the target moved
-		hostKey := st.Connection.HostKey
-		if c.Host != st.Connection.Host || c.Port != st.Connection.Port || c.Mode != st.Connection.Mode {
-			hostKey = ""
-		}
-		c.HostKey = hostKey
-		st.Connection = c
 		st.BackupRetention = in.BackupRetention
 		st.SessionHours = in.SessionHours
 		st.Offsite.Enabled = in.Offsite.Enabled
@@ -68,65 +50,15 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request, u *st
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if set.Connection != prev.Connection {
-		s.client.SetConfig(set.Connection)
-		s.cacheMu.Lock()
-		s.info, s.dns, s.lastFetch, s.liveErr = nil, nil, time.Time{}, nil
-		s.cacheMu.Unlock()
-	}
-	if set.BackupRetention < prev.BackupRetention && set.Connection.Configured() {
-		_ = s.client.Prune(r.Context(), set.BackupRetention)
-		s.pruneMirror(set.BackupRetention)
+	if set.BackupRetention < prev.BackupRetention {
+		for _, cfg := range s.state.Servers() {
+			if sc := s.serverCtx(cfg.ID); sc != nil && cfg.Connection.Configured() {
+				_ = sc.client.Prune(r.Context(), set.BackupRetention)
+				sc.pruneMirror(set.BackupRetention)
+			}
+		}
 	}
 	writeJSON(w, s.settingsView())
-}
-
-// handleConnTest checks the connection and reports the host key when it
-// still needs to be trusted.
-func (s *Server) handleConnTest(w http.ResponseWriter, r *http.Request, u *store.User) {
-	cfg := s.client.Config()
-	if !cfg.Configured() {
-		writeErr(w, http.StatusBadRequest, "Enter the Caddy server's address first.")
-		return
-	}
-	info, err := s.client.Info(r.Context())
-	if err != nil {
-		var hk *remote.HostKeyError
-		if errors.As(err, &hk) {
-			writeJSON(w, map[string]any{"ok": false, "needsTrust": true, "fingerprint": hk.Fingerprint, "changed": hk.Expected != "", "message": hk.Error()})
-			return
-		}
-		writeJSON(w, map[string]any{"ok": false, "message": remote.Explain(err).Message})
-		return
-	}
-	s.cacheMu.Lock()
-	s.info, s.infoAt, s.lastFetch = info, time.Now(), time.Time{}
-	s.cacheMu.Unlock()
-	msg := "Connected to " + info.Hostname + " (Caddy " + info.CaddyVersion + ")."
-	if !info.Writable {
-		msg += " Warning: the agent can't write " + info.Caddyfile + " — re-run the installer."
-	}
-	writeJSON(w, map[string]any{"ok": true, "info": info, "message": msg})
-}
-
-func (s *Server) handleConnTrust(w http.ResponseWriter, r *http.Request, u *store.User) {
-	var in struct {
-		Fingerprint string `json:"fingerprint"`
-	}
-	if !readJSON(w, r, &in) {
-		return
-	}
-	if !strings.HasPrefix(in.Fingerprint, "SHA256:") {
-		writeErr(w, http.StatusBadRequest, "invalid fingerprint")
-		return
-	}
-	set, err := s.state.UpdateSettings(func(st *store.Settings) { st.Connection.HostKey = in.Fingerprint })
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	s.client.SetConfig(set.Connection)
-	s.handleConnTest(w, r, u)
 }
 
 // ---- users ----

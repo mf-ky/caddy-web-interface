@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -57,22 +58,22 @@ func caddyErrorResponse(w http.ResponseWriter, ce *remote.CaddyError, text strin
 	writeErrData(w, code, msg, data)
 }
 
-func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request, u *store.User) {
-	s.draftMu.Lock()
-	text := s.state.Draft().Text
-	s.draftMu.Unlock()
+func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
+	sc.draftMu.Lock()
+	text := sc.st.Draft().Text
+	sc.draftMu.Unlock()
 	if strings.TrimSpace(text) == "" {
 		writeErr(w, http.StatusBadRequest, "Nothing to validate.")
 		return
 	}
-	if err := s.client.Validate(r.Context(), text); err != nil {
+	if err := sc.client.Validate(r.Context(), text); err != nil {
 		caddyErrorResponse(w, remote.Explain(err), text)
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true, "message": "Caddy says the configuration is valid."})
 }
 
-func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, u *store.User) {
+func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
 	var in struct {
 		Rev   int64 `json:"rev"`
 		Force bool  `json:"force"` // overwrite changes made on the server
@@ -80,16 +81,16 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, u *store.Us
 	if !readJSON(w, r, &in) {
 		return
 	}
-	live, liveErr := s.syncLive(r.Context(), true)
+	live, liveErr := sc.syncLive(r.Context(), true)
 	if liveErr != nil {
 		caddyErrorResponse(w, liveErr, "")
 		return
 	}
-	s.draftMu.Lock()
-	defer s.draftMu.Unlock()
-	d := s.currentDraft(live)
+	sc.draftMu.Lock()
+	defer sc.draftMu.Unlock()
+	d := sc.currentDraft(live)
 	if in.Rev != d.Rev {
-		writeErrData(w, http.StatusConflict, "The draft changed since you reviewed it. Please review again.", map[string]any{"state": s.buildState(r.Context(), u, live, nil, d)})
+		writeErrData(w, http.StatusConflict, "The draft changed since you reviewed it. Please review again.", map[string]any{"state": sc.buildState(r.Context(), u, live, nil, d)})
 		return
 	}
 	if shaOf(d.Text) == live.SHA {
@@ -100,68 +101,68 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, u *store.Us
 	if in.Force {
 		expected = live.SHA
 	}
-	res, err := s.client.Apply(r.Context(), d.Text, expected)
+	res, err := sc.client.Apply(r.Context(), d.Text, expected)
 	if err != nil {
 		ce := remote.Explain(err)
 		if ce.Kind == "conflict" {
 			ce.Message = "Someone changed the Caddyfile on the server after you started editing. Review the server's changes, then either discard your draft or keep it and apply again."
 		}
-		_ = s.state.AddHistory(store.ApplyRecord{Time: time.Now(), User: u.Username, Action: "apply", OK: false, Error: ce.Message, Changes: d.Log})
+		_ = sc.st.AddHistory(store.ApplyRecord{Time: time.Now(), User: u.Username, Action: "apply", OK: false, Error: ce.Message, Changes: d.Log})
 		caddyErrorResponse(w, ce, d.Text)
 		return
 	}
 	changes := d.Log
 	newLive := store.Live{Text: d.Text, SHA: shaOf(d.Text), Fetched: time.Now()}
-	_ = s.state.SetLive(newLive)
+	_ = sc.st.SetLive(newLive)
 	d.BaseSHA, d.Log, d.Creators = newLive.SHA, nil, map[string]string{}
 	d.Rev++
-	_ = s.state.SetDraft(d)
-	_ = s.state.AddHistory(store.ApplyRecord{Time: time.Now(), User: u.Username, Action: "apply", OK: true, Backup: res.Backup, Changes: changes})
-	s.afterChange(res.Backup)
-	st := s.buildState(r.Context(), u, newLive, nil, d)
+	_ = sc.st.SetDraft(d)
+	_ = sc.st.AddHistory(store.ApplyRecord{Time: time.Now(), User: u.Username, Action: "apply", OK: true, Backup: res.Backup, Changes: changes})
+	s.afterChange(sc, res.Backup)
+	st := sc.buildState(r.Context(), u, newLive, nil, d)
 	writeJSON(w, map[string]any{"ok": true, "backup": res.Backup, "state": st})
 }
 
 // afterChange prunes old backups, mirrors the new one and runs the offsite
 // copy. It runs in the background so Apply returns quickly.
-func (s *Server) afterChange(backup string) {
+func (s *Server) afterChange(sc *serverCtx, backup string) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		keep := s.state.Settings().BackupRetention
-		if err := s.client.Prune(ctx, keep); err != nil {
+		if err := sc.client.Prune(ctx, keep); err != nil {
 			log.Printf("pruning backups: %v", err)
 		}
 		if backup != "" {
-			if err := s.mirrorBackup(ctx, backup); err != nil {
+			if err := sc.mirrorBackup(ctx, backup); err != nil {
 				log.Printf("mirroring backup %s: %v", backup, err)
 			}
 		}
-		s.pruneMirror(keep)
+		sc.pruneMirror(keep)
 		if s.state.Settings().Offsite.Enabled {
 			s.runOffsite(ctx)
 		}
 	}()
 }
 
-func (s *Server) mirrorDir() string { return filepath.Join(s.dataDir, "backups") }
+func (sc *serverCtx) mirrorDir() string { return filepath.Join(sc.st.Dir(), "backups") }
 
-func (s *Server) mirrorBackup(ctx context.Context, name string) error {
+func (sc *serverCtx) mirrorBackup(ctx context.Context, name string) error {
 	if !remote.ValidBackupName(name) {
 		return errors.New("invalid backup name")
 	}
-	text, err := s.client.BackupRead(ctx, name)
+	text, err := sc.client.BackupRead(ctx, name)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(s.mirrorDir(), 0o700); err != nil {
+	if err := os.MkdirAll(sc.mirrorDir(), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(s.mirrorDir(), name), []byte(text), 0o600)
+	return os.WriteFile(filepath.Join(sc.mirrorDir(), name), []byte(text), 0o600)
 }
 
-func (s *Server) pruneMirror(keep int) {
-	entries, err := os.ReadDir(s.mirrorDir())
+func (sc *serverCtx) pruneMirror(keep int) {
+	entries, err := os.ReadDir(sc.mirrorDir())
 	if err != nil {
 		return
 	}
@@ -174,22 +175,21 @@ func (s *Server) pruneMirror(keep int) {
 	sort.Sort(sort.Reverse(sort.StringSlice(names)))
 	for i, n := range names {
 		if i >= keep {
-			_ = os.Remove(filepath.Join(s.mirrorDir(), n))
+			_ = os.Remove(filepath.Join(sc.mirrorDir(), n))
 		}
 	}
 }
 
-// runOffsite copies the mirrored backups somewhere else with rsync.
+// runOffsite copies every server's mirrored backups somewhere else with
+// rsync, into one sub-folder per server.
 func (s *Server) runOffsite(ctx context.Context) error {
 	set := s.state.Settings().Offsite
-	if strings.TrimSpace(set.Target) == "" {
+	target := strings.TrimSpace(set.Target)
+	if target == "" {
 		return errors.New("no rsync destination set")
 	}
 	if _, err := exec.LookPath("rsync"); err != nil {
 		return s.recordOffsite(errors.New("rsync is not installed on the CaddyWeb machine"))
-	}
-	if err := os.MkdirAll(s.mirrorDir(), 0o700); err != nil {
-		return s.recordOffsite(err)
 	}
 	port := set.Port
 	if port == 0 {
@@ -198,16 +198,28 @@ func (s *Server) runOffsite(ctx context.Context) error {
 	sshCmd := "ssh -i " + shellQuote(remote.KeyPath(filepath.Join(s.dataDir, "ssh"))) +
 		" -p " + strconv.Itoa(port) +
 		" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=" + shellQuote(filepath.Join(s.dataDir, "ssh", "known_hosts_offsite"))
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	if !strings.HasSuffix(target, "/") {
+		target += "/"
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "rsync", "-a", "--timeout=60", "-e", sshCmd, s.mirrorDir()+"/", set.Target)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		msg := strings.TrimSpace(string(out))
-		if msg == "" {
-			msg = err.Error()
+	for _, cfg := range s.state.Servers() {
+		sc := s.serverCtx(cfg.ID)
+		if sc == nil {
+			continue
 		}
-		return s.recordOffsite(errors.New(msg))
+		if err := os.MkdirAll(sc.mirrorDir(), 0o700); err != nil {
+			return s.recordOffsite(err)
+		}
+		cmd := exec.CommandContext(ctx, "rsync", "-a", "--timeout=60", "-e", sshCmd, sc.mirrorDir()+"/", target+cfg.ID+"/")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			msg := strings.TrimSpace(string(out))
+			if msg == "" {
+				msg = err.Error()
+			}
+			return s.recordOffsite(fmt.Errorf("%s: %s", cfg.Name, msg))
+		}
 	}
 	return s.recordOffsite(nil)
 }
@@ -228,12 +240,18 @@ func (s *Server) recordOffsite(err error) error {
 	return err
 }
 
+// handleOffsiteRun fills in any missing local backup copies, then rsyncs.
 func (s *Server) handleOffsiteRun(w http.ResponseWriter, r *http.Request, u *store.User) {
-	// make sure the local mirror has everything the server has
-	if list, err := s.client.Backups(r.Context()); err == nil {
-		for _, b := range list {
-			if _, err := os.Stat(filepath.Join(s.mirrorDir(), b.Name)); err != nil {
-				_ = s.mirrorBackup(r.Context(), b.Name)
+	for _, cfg := range s.state.Servers() {
+		sc := s.serverCtx(cfg.ID)
+		if sc == nil || !sc.client.Config().Configured() {
+			continue
+		}
+		if list, err := sc.client.Backups(r.Context()); err == nil {
+			for _, b := range list {
+				if _, err := os.Stat(filepath.Join(sc.mirrorDir(), b.Name)); err != nil {
+					_ = sc.mirrorBackup(r.Context(), b.Name)
+				}
 			}
 		}
 	}
@@ -241,19 +259,19 @@ func (s *Server) handleOffsiteRun(w http.ResponseWriter, r *http.Request, u *sto
 		writeErr(w, http.StatusBadGateway, "rsync failed: "+err.Error())
 		return
 	}
-	writeJSON(w, map[string]any{"ok": true, "settings": s.state.Settings().Offsite})
+	writeJSON(w, map[string]any{"ok": true, "offsite": s.state.Settings().Offsite})
 }
 
 // ---- backups ----
 
-func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request, u *store.User) {
-	list, err := s.client.Backups(r.Context())
+func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
+	list, err := sc.client.Backups(r.Context())
 	if err != nil {
 		caddyErrorResponse(w, remote.Explain(err), "")
 		return
 	}
 	who := map[string]store.ApplyRecord{}
-	for _, h := range s.state.History() {
+	for _, h := range sc.st.History() {
 		if h.Backup != "" {
 			who[h.Backup] = h
 		}
@@ -270,30 +288,30 @@ func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request, u *store.
 		if h, ok := who[b.Name]; ok {
 			it.ReplacedBy, it.Action = h.User, h.Action
 		}
-		if _, err := os.Stat(filepath.Join(s.mirrorDir(), b.Name)); err == nil {
+		if _, err := os.Stat(filepath.Join(sc.mirrorDir(), b.Name)); err == nil {
 			it.Mirrored = true
 		}
 		items = append(items, it)
 	}
 	dir := ""
-	if info := s.cachedInfo(r.Context()); info != nil {
+	if info := sc.cachedInfo(r.Context()); info != nil {
 		dir = info.BackupDir
 	}
 	set := s.state.Settings()
 	writeJSON(w, map[string]any{
 		"backups": items, "retention": set.BackupRetention, "dir": dir,
-		"mirrorDir": s.mirrorDir(), "offsite": set.Offsite,
+		"mirrorDir": sc.mirrorDir(), "offsite": set.Offsite,
 	})
 }
 
-func (s *Server) handleBackupRead(w http.ResponseWriter, r *http.Request, u *store.User) {
+func (s *Server) handleBackupRead(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
 	name := r.PathValue("name")
-	text, err := s.client.BackupRead(r.Context(), name)
+	text, err := sc.client.BackupRead(r.Context(), name)
 	if err != nil {
 		caddyErrorResponse(w, remote.Explain(err), "")
 		return
 	}
-	live, _ := s.syncLive(r.Context(), false)
+	live, _ := sc.syncLive(r.Context(), false)
 	cur := live.Text
 	if u.Role != store.RoleAdmin {
 		text, cur = caddyfile.RedactText(text), caddyfile.RedactText(cur)
@@ -303,9 +321,9 @@ func (s *Server) handleBackupRead(w http.ResponseWriter, r *http.Request, u *sto
 	writeJSON(w, map[string]any{"name": name, "text": text, "diff": diff.Hunks(lines, 3), "added": add, "removed": rem})
 }
 
-func (s *Server) handleBackupDownload(w http.ResponseWriter, r *http.Request, u *store.User) {
+func (s *Server) handleBackupDownload(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
 	name := r.PathValue("name")
-	text, err := s.client.BackupRead(r.Context(), name)
+	text, err := sc.client.BackupRead(r.Context(), name)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, remote.Explain(err).Message)
 		return
@@ -315,7 +333,7 @@ func (s *Server) handleBackupDownload(w http.ResponseWriter, r *http.Request, u 
 	_, _ = w.Write([]byte(text))
 }
 
-func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, u *store.User) {
+func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
 	name := r.PathValue("name")
 	var in struct {
 		DiscardDraft bool `json:"discardDraft"`
@@ -323,53 +341,53 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, u *store.
 	if !readJSON(w, r, &in) {
 		return
 	}
-	live, liveErr := s.syncLive(r.Context(), true)
+	live, liveErr := sc.syncLive(r.Context(), true)
 	if liveErr != nil {
 		caddyErrorResponse(w, liveErr, "")
 		return
 	}
-	s.draftMu.Lock()
-	defer s.draftMu.Unlock()
-	d := s.currentDraft(live)
+	sc.draftMu.Lock()
+	defer sc.draftMu.Unlock()
+	d := sc.currentDraft(live)
 	if shaOf(d.Text) != live.SHA && !in.DiscardDraft {
 		writeErrData(w, http.StatusConflict, "You have unapplied changes. Restoring a backup will discard them.", map[string]any{"needsDiscard": true})
 		return
 	}
-	text, err := s.client.BackupRead(r.Context(), name)
+	text, err := sc.client.BackupRead(r.Context(), name)
 	if err != nil {
 		caddyErrorResponse(w, remote.Explain(err), "")
 		return
 	}
-	res, err := s.client.Restore(r.Context(), name, live.SHA)
+	res, err := sc.client.Restore(r.Context(), name, live.SHA)
 	if err != nil {
 		ce := remote.Explain(err)
-		_ = s.state.AddHistory(store.ApplyRecord{Time: time.Now(), User: u.Username, Action: "restore", OK: false, Error: ce.Message, Note: name})
+		_ = sc.st.AddHistory(store.ApplyRecord{Time: time.Now(), User: u.Username, Action: "restore", OK: false, Error: ce.Message, Note: name})
 		caddyErrorResponse(w, ce, text)
 		return
 	}
 	newLive := store.Live{Text: text, SHA: shaOf(text), Fetched: time.Now()}
-	_ = s.state.SetLive(newLive)
+	_ = sc.st.SetLive(newLive)
 	d = store.Draft{Text: text, BaseSHA: newLive.SHA, Rev: d.Rev + 1, Creators: map[string]string{}}
-	_ = s.state.SetDraft(d)
-	_ = s.state.AddHistory(store.ApplyRecord{Time: time.Now(), User: u.Username, Action: "restore", OK: true, Backup: res.Backup, Note: name})
-	s.afterChange(res.Backup)
-	writeJSON(w, map[string]any{"ok": true, "backup": res.Backup, "state": s.buildState(r.Context(), u, newLive, nil, d)})
+	_ = sc.st.SetDraft(d)
+	_ = sc.st.AddHistory(store.ApplyRecord{Time: time.Now(), User: u.Username, Action: "restore", OK: true, Backup: res.Backup, Note: name})
+	s.afterChange(sc, res.Backup)
+	writeJSON(w, map[string]any{"ok": true, "backup": res.Backup, "state": sc.buildState(r.Context(), u, newLive, nil, d)})
 }
 
-func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request, u *store.User) {
-	writeJSON(w, map[string]any{"history": s.state.History()})
+func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
+	writeJSON(w, map[string]any{"history": sc.st.History()})
 }
 
-func (s *Server) handleDNSProviders(w http.ResponseWriter, r *http.Request, u *store.User) {
-	s.cacheMu.Lock()
-	if s.dns != nil && time.Since(s.dnsAt) < 5*time.Minute && r.URL.Query().Get("refresh") != "1" {
-		list := s.dns
-		s.cacheMu.Unlock()
+func (s *Server) handleDNSProviders(w http.ResponseWriter, r *http.Request, u *store.User, sc *serverCtx) {
+	sc.cacheMu.Lock()
+	if sc.dns != nil && time.Since(sc.dnsAt) < 5*time.Minute && r.URL.Query().Get("refresh") != "1" {
+		list := sc.dns
+		sc.cacheMu.Unlock()
 		writeJSON(w, map[string]any{"installed": list})
 		return
 	}
-	s.cacheMu.Unlock()
-	list, err := s.client.DNSProviders(r.Context())
+	sc.cacheMu.Unlock()
+	list, err := sc.client.DNSProviders(r.Context())
 	if err != nil {
 		writeJSON(w, map[string]any{"installed": []string{}, "error": remote.Explain(err).Message})
 		return
@@ -377,8 +395,8 @@ func (s *Server) handleDNSProviders(w http.ResponseWriter, r *http.Request, u *s
 	if list == nil {
 		list = []string{}
 	}
-	s.cacheMu.Lock()
-	s.dns, s.dnsAt = list, time.Now()
-	s.cacheMu.Unlock()
+	sc.cacheMu.Lock()
+	sc.dns, sc.dnsAt = list, time.Now()
+	sc.cacheMu.Unlock()
 	writeJSON(w, map[string]any{"installed": list})
 }

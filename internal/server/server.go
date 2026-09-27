@@ -7,10 +7,12 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
+
+	"golang.org/x/crypto/ssh"
 
 	"github.com/mf-ky/caddy-web-interface/agent"
 	"github.com/mf-ky/caddy-web-interface/internal/remote"
@@ -23,22 +25,16 @@ type Server struct {
 	version   string
 	users     *store.Users
 	state     *store.State
-	client    *remote.Client
+	signer    ssh.Signer
 	publicKey string
 	secret    []byte
 	static    fs.FS
 
 	limiter limiter
 	setupMu sync.Mutex
-	draftMu sync.Mutex // serialises draft edits, apply and restore
 
-	cacheMu   sync.Mutex
-	info      *remote.Info
-	infoAt    time.Time
-	dns       []string
-	dnsAt     time.Time
-	liveErr   *remote.CaddyError
-	lastFetch time.Time
+	ctxMu sync.Mutex
+	ctxs  map[string]*serverCtx
 }
 
 // Options configure New.
@@ -50,6 +46,9 @@ type Options struct {
 
 // New opens the data directory and prepares the server.
 func New(opts Options) (*Server, error) {
+	if err := os.MkdirAll(opts.DataDir, 0o700); err != nil {
+		return nil, err
+	}
 	users, err := store.OpenUsers(opts.DataDir)
 	if err != nil {
 		return nil, err
@@ -68,8 +67,8 @@ func New(opts Options) (*Server, error) {
 	}
 	s := &Server{
 		dataDir: opts.DataDir, version: opts.Version, users: users, state: st,
-		publicKey: pub, secret: secret, static: opts.Static,
-		client: remote.NewClient(st.Settings().Connection, signer),
+		publicKey: pub, secret: secret, static: opts.Static, signer: signer,
+		ctxs: map[string]*serverCtx{},
 	}
 	return s, nil
 }
@@ -97,40 +96,57 @@ func (s *Server) Handler() http.Handler {
 	}
 
 	mux.HandleFunc("POST /api/me/password", any(s.handleChangePassword))
-	mux.HandleFunc("GET /api/state", any(s.handleState))
-	mux.HandleFunc("GET /api/draft/diff", any(s.handleDraftDiff))
-	mux.HandleFunc("GET /api/caddyfile", any(s.handleCaddyfileText))
-	mux.HandleFunc("GET /api/history", any(s.handleHistory))
-	mux.HandleFunc("GET /api/backups", any(s.handleBackups))
-	mux.HandleFunc("GET /api/backups/{name}", any(s.handleBackupRead))
-	mux.HandleFunc("GET /api/dns-providers", any(s.handleDNSProviders))
+	mux.HandleFunc("GET /api/servers", any(s.handleServers))
+	mux.HandleFunc("POST /api/tools/hash-password", power(s.handleHashPassword))
 
-	// power users may add new cards (and edit the ones they added before Apply)
-	mux.HandleFunc("POST /api/draft/segments", power(s.handleAddSegment))
-	mux.HandleFunc("PUT /api/draft/segments/{id}", power(s.handleUpdateSegment))
-	mux.HandleFunc("PUT /api/draft/segments/{id}/raw", power(s.handleUpdateSegmentRaw))
-	mux.HandleFunc("POST /api/draft/preview", power(s.handlePreview))
-	mux.HandleFunc("POST /api/validate", power(s.handleValidate))
-
-	// admin only
-	mux.HandleFunc("DELETE /api/draft/segments/{id}", admin(s.handleDeleteSegment))
-	mux.HandleFunc("POST /api/draft/segments/{id}/revert", admin(s.handleRevertSegment))
-	mux.HandleFunc("POST /api/draft/restore-deleted", admin(s.handleRestoreDeleted))
-	mux.HandleFunc("PUT /api/draft/raw", admin(s.handleDraftRaw))
-	mux.HandleFunc("POST /api/draft/discard", admin(s.handleDiscard))
-	mux.HandleFunc("POST /api/draft/rebase", admin(s.handleRebase))
-	mux.HandleFunc("POST /api/apply", admin(s.handleApply))
-	mux.HandleFunc("POST /api/backups/{name}/restore", admin(s.handleRestore))
-	mux.HandleFunc("GET /api/backups/{name}/download", admin(s.handleBackupDownload))
+	// admin only: servers, users, global settings
+	mux.HandleFunc("POST /api/servers", admin(s.handleAddServer))
 	mux.HandleFunc("GET /api/settings", admin(s.handleGetSettings))
 	mux.HandleFunc("PUT /api/settings", admin(s.handlePutSettings))
-	mux.HandleFunc("POST /api/connection/test", admin(s.handleConnTest))
-	mux.HandleFunc("POST /api/connection/trust", admin(s.handleConnTrust))
 	mux.HandleFunc("POST /api/offsite/run", admin(s.handleOffsiteRun))
 	mux.HandleFunc("GET /api/users", admin(s.handleUsers))
 	mux.HandleFunc("POST /api/users", admin(s.handleAddUser))
 	mux.HandleFunc("PUT /api/users/{name}", admin(s.handleUpdateUser))
 	mux.HandleFunc("DELETE /api/users/{name}", admin(s.handleDeleteUser))
+
+	// per server: /api/servers/{sid}/...
+	viewer := []store.Role{store.RoleViewer, store.RolePower, store.RoleAdmin}
+	powerRoles := []store.Role{store.RolePower, store.RoleAdmin}
+	adminRole := []store.Role{store.RoleAdmin}
+	srv := func(pattern string, h serverHandler, roles []store.Role) {
+		method, path, _ := strings.Cut(pattern, " ")
+		mux.HandleFunc(method+" /api/servers/{sid}"+path, s.onServer(h, roles...))
+	}
+	srv("GET ", s.handleServer, viewer)
+	srv("GET /state", s.handleState, viewer)
+	srv("GET /draft/diff", s.handleDraftDiff, viewer)
+	srv("GET /caddyfile", s.handleCaddyfileText, viewer)
+	srv("GET /history", s.handleHistory, viewer)
+	srv("GET /backups", s.handleBackups, viewer)
+	srv("GET /backups/{name}", s.handleBackupRead, viewer)
+	srv("GET /dns-providers", s.handleDNSProviders, viewer)
+
+	// power users may add new cards (and edit the ones they added before Apply)
+	srv("POST /draft/segments", s.handleAddSegment, powerRoles)
+	srv("PUT /draft/segments/{id}", s.handleUpdateSegment, powerRoles)
+	srv("PUT /draft/segments/{id}/raw", s.handleUpdateSegmentRaw, powerRoles)
+	srv("POST /draft/segments/{id}/copy", s.handleCopySegment, powerRoles)
+	srv("POST /draft/preview", s.handlePreview, powerRoles)
+	srv("POST /validate", s.handleValidate, powerRoles)
+
+	srv("PUT ", s.handleUpdateServer, adminRole)
+	srv("DELETE ", s.handleDeleteServer, adminRole)
+	srv("POST /test", s.handleConnTest, adminRole)
+	srv("POST /trust", s.handleConnTrust, adminRole)
+	srv("DELETE /draft/segments/{id}", s.handleDeleteSegment, adminRole)
+	srv("POST /draft/segments/{id}/revert", s.handleRevertSegment, adminRole)
+	srv("POST /draft/restore-deleted", s.handleRestoreDeleted, adminRole)
+	srv("PUT /draft/raw", s.handleDraftRaw, adminRole)
+	srv("POST /draft/discard", s.handleDiscard, adminRole)
+	srv("POST /draft/rebase", s.handleRebase, adminRole)
+	srv("POST /apply", s.handleApply, adminRole)
+	srv("POST /backups/{name}/restore", s.handleRestore, adminRole)
+	srv("GET /backups/{name}/download", s.handleBackupDownload, adminRole)
 
 	mux.Handle("/", s.staticHandler())
 	return s.secure(mux)
